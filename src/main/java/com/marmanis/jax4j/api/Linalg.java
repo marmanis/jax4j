@@ -1006,53 +1006,149 @@ public final class Linalg {
         }
     }
 
-    private static double[] luSolveDouble(double[] a, double[] b, int n) {
-        // Precompute a rough scale for singularity check.
-        double norm = 0.0;
+    /**
+     * Factor {@code a} in place into packed Doolittle LU form. {@code L}'s
+     * strict lower triangle overwrites the corresponding entries of
+     * {@code a}; {@code U} occupies the diagonal and above. The returned
+     * permutation vector records the row swaps applied during pivoting.
+     * The per-step pivot check depends on {@code check}: under
+     * {@link SingularityCheck#SINGULARITY_CHECK_SUBMATRIX_MAX} a pivot must
+     * clear {@code eps × ‖A‖_max} of the original matrix; under
+     * {@link SingularityCheck#SINGULARITY_CHECK_RECIPROCAL_CONDITION_EST}
+     * only exact-zero pivots are rejected here — ill-conditioning is
+     * caught post-facto by Hager's iteration in the caller.
+     */
+    private static LU luFactorInPlace(double[] a, int n, SingularityCheck check) {
+        // Elementwise ‖A‖_max is the natural "submatrix max at step 0"
+        // and the reference the SUBMATRIX_MAX check uses. Scale-invariant
+        // across the whole matrix (unlike the row-sum norm, which biases
+        // toward rows with many small entries).
+        double origMax = 0.0;
+        for (int i = 0; i < n * n; i++) {
+            double v = Math.abs(a[i]);
+            if (v > origMax) origMax = v;
+        }
+        // Also retain ‖A‖_∞ (row-sum) — that's what κ_∞ = ‖A‖_∞ · ‖A⁻¹‖_∞
+        // needs, so we compute it here rather than making Linalg.cond
+        // re-scan A after the factorisation has already overwritten it.
+        double origInfNorm = 0.0;
         for (int i = 0; i < n; i++) {
             double rowSum = 0.0;
             for (int j = 0; j < n; j++) rowSum += Math.abs(a[i * n + j]);
-            if (rowSum > norm) norm = rowSum;
+            if (rowSum > origInfNorm) origInfNorm = rowSum;
         }
-        double singTol = 1e-14 * Math.max(norm, 1.0);
-        // Forward elimination with partial pivoting.
+        double stepTol = (check == SingularityCheck.SINGULARITY_CHECK_SUBMATRIX_MAX)
+            ? 1e-14 * origMax
+            : 0.0;
+        int[] piv = new int[n];
+        for (int i = 0; i < n; i++) piv[i] = i;
         for (int k = 0; k < n; k++) {
-            int piv = k;
+            int pivRow = k;
             double pivAbs = Math.abs(a[k * n + k]);
             for (int i = k + 1; i < n; i++) {
                 double v = Math.abs(a[i * n + k]);
-                if (v > pivAbs) { pivAbs = v; piv = i; }
+                if (v > pivAbs) { pivAbs = v; pivRow = i; }
             }
-            if (pivAbs <= singTol) {
+            if (pivAbs == 0.0) {
+                // Structural singularity: even partial pivoting can't find
+                // a non-zero entry in column k. Always fatal — a zero
+                // pivot would divide by zero on the next line.
                 throw new IllegalArgumentException(
-                    "solve: matrix is singular (pivot " + pivAbs + " below tolerance " + singTol + ")");
+                    "lu: matrix is singular (column " + k + " has zero pivot)");
             }
-            if (piv != k) {
+            if (pivAbs <= stepTol) {
+                throw new IllegalArgumentException(
+                    "lu: matrix is singular under SUBMATRIX_MAX check (pivot "
+                        + pivAbs + " ≤ " + stepTol + " = 1e-14 × ‖A‖_max)");
+            }
+            if (pivRow != k) {
                 for (int j = 0; j < n; j++) {
                     double t = a[k * n + j];
-                    a[k * n + j] = a[piv * n + j];
-                    a[piv * n + j] = t;
+                    a[k * n + j] = a[pivRow * n + j];
+                    a[pivRow * n + j] = t;
                 }
-                double t = b[k]; b[k] = b[piv]; b[piv] = t;
+                int t = piv[k]; piv[k] = piv[pivRow]; piv[pivRow] = t;
             }
             double pivInv = 1.0 / a[k * n + k];
             for (int i = k + 1; i < n; i++) {
                 double factor = a[i * n + k] * pivInv;
+                // Store the L multiplier in place of the eliminated entry
+                // so a later solve can reconstruct the factorisation.
+                a[i * n + k] = factor;
                 if (factor == 0.0) continue;
-                a[i * n + k] = 0.0;
                 for (int j = k + 1; j < n; j++) {
                     a[i * n + j] -= factor * a[k * n + j];
                 }
-                b[i] -= factor * b[k];
             }
         }
-        // Back-substitute.
+        return new LU(a, piv, n, origInfNorm);
+    }
+
+    // -----------------------------------------------------------------
+    // Reciprocal condition estimation via Hager's algorithm
+    // -----------------------------------------------------------------
+
+    /**
+     * Reject threshold for RECIPROCAL_CONDITION_EST. {@code rcond < 1e-14}
+     * corresponds to {@code κ_∞ > 10¹⁴} — the point at which double-
+     * precision LU has lost all but a couple of digits of accuracy.
+     */
+    private static final double RCOND_TOL = 1e-14;
+
+    /**
+     * Compute {@code rcond = 1 / (‖A‖_∞ · ‖A⁻¹‖_∞)} using {@code lu}'s
+     * cached {@code ‖A‖_∞} and a Hager iteration for {@code ‖A⁻¹‖_∞}.
+     */
+    private static double reciprocalConditionNumber(LU lu) {
+        if (lu.origInfNorm == 0.0) return 0.0;
+        double normInvInf = hagerNormInvInf(lu);
+        if (normInvInf == 0.0) return Double.POSITIVE_INFINITY; // A ≡ 0 already handled above
+        return 1.0 / (lu.origInfNorm * normInvInf);
+    }
+
+    /**
+     * Estimate {@code ‖A⁻¹‖_∞} via Hager's algorithm, exploiting the
+     * duality {@code ‖A⁻¹‖_∞ = ‖(Aᵀ)⁻¹‖_1}. Hager estimates the 1-norm
+     * of a matrix {@code B} available only through {@code B · v} and
+     * {@code Bᵀ · v} products; taking {@code B = (Aᵀ)⁻¹} means
+     * {@code B v = solveTranspose(v)} and {@code Bᵀ v = solve(v)},
+     * both O(n²) against the cached LU.
+     *
+     * <p>Same iteration LAPACK's {@code DGECON} uses; typically converges
+     * in 2–4 iterations for real problems. Result is a lower bound on
+     * the true norm — Hager can under-estimate, but by a factor no worse
+     * than a small constant in practice.
+     */
+    private static double hagerNormInvInf(LU lu) {
+        int n = lu.n;
         double[] x = new double[n];
-        for (int i = n - 1; i >= 0; i--) {
-            double s = b[i];
-            for (int j = i + 1; j < n; j++) s -= a[i * n + j] * x[j];
-            x[i] = s / a[i * n + i];
+        double init = 1.0 / n;
+        for (int i = 0; i < n; i++) x[i] = init;
+        double estimate = 0.0;
+        int maxIter = 5;
+        for (int iter = 0; iter < maxIter; iter++) {
+            double[] y = lu.solveTranspose(x);  // B x
+            double yNorm1 = 0.0;
+            for (double v : y) yNorm1 += Math.abs(v);
+            if (iter > 0 && yNorm1 <= estimate) break;
+            estimate = yNorm1;
+            double[] xi = new double[n];
+            for (int i = 0; i < n; i++) xi[i] = y[i] >= 0.0 ? 1.0 : -1.0;
+            double[] z = lu.solve(xi);          // Bᵀ ξ
+            int jStar = 0;
+            double zMax = Math.abs(z[0]);
+            for (int i = 1; i < n; i++) {
+                double av = Math.abs(z[i]);
+                if (av > zMax) { zMax = av; jStar = i; }
+            }
+            double zTx = 0.0;
+            for (int i = 0; i < n; i++) zTx += z[i] * x[i];
+            // Convergence: no coordinate direction beats the current
+            // estimate. This is Hager's stopping rule.
+            if (zMax <= Math.abs(zTx)) break;
+            for (int i = 0; i < n; i++) x[i] = 0.0;
+            x[jStar] = 1.0;
         }
-        return x;
+        return estimate;
     }
 }

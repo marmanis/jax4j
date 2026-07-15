@@ -184,6 +184,34 @@ public final class Fft {
         throw new IllegalArgumentException("dctI requires FLOAT32 or FLOAT64 input, got " + x.dtype());
     }
 
+    /**
+     * Raw {@code double[]} overload of {@link #dctI(NDArray)} — same
+     * transform, but skips the {@link NDArray} / {@link Shape} wrapping on
+     * the way in and out. Intended for tight host-side loops that call
+     * DCT-I many times per second and can't afford the per-call allocation
+     * of {@code ConcreteNDArray} and {@code Shape} objects on both sides
+     * (chebfun4j's adaptive Chebtech constructor is the canonical
+     * consumer: it hits this on every grid-doubling probe).
+     *
+     * <p>The input array is <em>not</em> mutated. The return is always a
+     * fresh {@code double[]} — even in the length-1 special case, which
+     * returns {@code {x[0]}} rather than aliasing the caller's array.
+     *
+     * <p>Same length constraint as {@link #dctI(NDArray)}: {@code x.length}
+     * must be {@code 1} or of the form {@code 2^k + 1}.
+     */
+    public static double[] dctIRaw(double[] x) {
+        int n = x.length;
+        if (n == 0) throw new IllegalArgumentException("dctIRaw: input must be non-empty");
+        if (n == 1) return new double[]{x[0]};
+        int m = n - 1;
+        if (Integer.bitCount(m) != 1) {
+            throw new IllegalArgumentException(
+                "dctIRaw requires (N - 1) to be a power of two, got N = " + n);
+        }
+        return dctIDouble(x);
+    }
+
     private static NDArray[] complexTransform(NDArray re, NDArray im, boolean inverse) {
         if (re.shape().rank() != 1 || im.shape().rank() != 1) {
             throw new IllegalArgumentException(

@@ -21,6 +21,50 @@ public final class Linalg {
     private Linalg() {}
 
     /**
+     * How the LU factorisation should decide that {@code A} is too close
+     * to singular to solve. Passed to {@link #lu(NDArray, SingularityCheck)}
+     * and {@link #solve(NDArray, NDArray, SingularityCheck)}.
+     */
+    public enum SingularityCheck {
+        /**
+         * <b>Default.</b> Growth-factor / submatrix-max check: compare each
+         * pivot chosen by partial pivoting to {@code eps × ‖A‖_max}, where
+         * {@code ‖A‖_max} is the largest absolute value in the original
+         * matrix and {@code eps = 1e-14}. Partial pivoting picks the max of
+         * the current column in the active submatrix, so this fires
+         * exactly when no row in the remaining submatrix has a usable
+         * entry in that column — the classical elimination-time signal of
+         * rank deficiency. Elementwise-scale invariant across the whole
+         * matrix (multiplying {@code A} by any nonzero constant leaves the
+         * decision unchanged), but not separately invariant per row —
+         * that's what {@link #SINGULARITY_CHECK_RECIPROCAL_CONDITION_EST}
+         * is for. Cost: one O(n²) pass over {@code A}, then negligible per
+         * elimination step.
+         */
+        SINGULARITY_CHECK_SUBMATRIX_MAX,
+
+        /**
+         * Reciprocal condition estimate: factor {@code A} rejecting only
+         * exact-zero pivots (to avoid NaN), then estimate
+         * {@code rcond = 1 / (‖A‖_∞ · ‖A⁻¹‖_∞)} via Hager's algorithm
+         * (LAPACK's {@code DGECON} approach) using ~5 solves against the
+         * cached factorisation. If {@code rcond < 1e-14} — i.e.,
+         * {@code κ_∞(A) > 10¹⁴} — the matrix is rejected as
+         * ill-conditioned. This correctly discriminates well-scaled
+         * ill-conditioned matrices ({@code κ ≥ 10¹⁴}, essentially
+         * numerically singular in double precision) from badly-scaled but
+         * well-conditioned ones (mixed row/column scales that trip the
+         * submatrix-max check without being actually near-singular). Cost:
+         * a handful of extra O(n²) back-substitutions after the O(n³)
+         * factorisation — small in relative terms, but not free.
+         *
+         * <p>For the estimate itself (not just to gate solves on it), use
+         * {@link Linalg#cond(NDArray)}.
+         */
+        SINGULARITY_CHECK_RECIPROCAL_CONDITION_EST
+    }
+
+    /**
      * Solve the square linear system {@code A x = b} for {@code x} via
      * Gaussian elimination with partial pivoting. {@code A} must be
      * {@code n×n} and {@code b} a length-{@code n} vector; both must

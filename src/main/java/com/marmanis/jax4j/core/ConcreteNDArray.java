@@ -14,11 +14,16 @@ import java.util.stream.IntStream;
 
 /**
  * A concrete implementation of NDArray that holds actual data in host memory.
- * Storage is genuinely typed: exactly one of {@code floatData}/{@code intData}/
- * {@code boolData}/{@code doubleData}/{@code longData} is populated, matching
- * {@link #dtype()} — there is no "float standing in for bool/int" representation
- * anywhere. Arithmetic (`add`/`mul`/.../`dot`/reductions) requires both operands
- * to share the same <em>floating</em> dtype (FLOAT32 or FLOAT64) and throws
+ * Storage is genuinely typed and held in a single {@link Storage} value — a
+ * sealed family with exactly one record per dtype, each wrapping one primitive
+ * array. There is no "float standing in for bool/int" representation anywhere,
+ * and — unlike the earlier five-parallel-nullable-fields layout — no way to
+ * represent a dtype/data mismatch: the record subtype <em>is</em> the dtype.
+ * Internal dispatch is a compiler-checked exhaustive {@code switch} over the
+ * storage rather than a hand-maintained {@code if (dtype == ...)} chain.
+ *
+ * <p>Arithmetic (`add`/`mul`/.../`dot`/reductions) requires both operands to
+ * share the same <em>floating</em> dtype (FLOAT32 or FLOAT64) and throws
  * otherwise; {@link #astype} is the explicit, principled way to convert.
  * FLOAT64 arithmetic always runs on the host (no TornadoVM kernel), unlike
  * FLOAT32 which dispatches to a device when explicitly placed.
@@ -29,70 +34,111 @@ public class ConcreteNDArray implements NDArray {
     private final Shape shape;
     private final DType dtype;
     private final Device device;
-    private final float[] floatData;
-    private final int[] intData;
-    private final boolean[] boolData;
-    private final double[] doubleData;
-    private final long[] longData;
+    private final Storage storage;
 
-    private ConcreteNDArray(float[] floatData, int[] intData, boolean[] boolData,
-                             double[] doubleData, long[] longData,
-                             Shape shape, DType dtype, Device device) {
-        this.floatData = floatData;
-        this.intData = intData;
-        this.boolData = boolData;
-        this.doubleData = doubleData;
-        this.longData = longData;
+    /**
+     * Typed backing store for a {@link ConcreteNDArray}: a sealed family with
+     * one record per dtype. Holding storage as a single sealed value (rather
+     * than five parallel nullable arrays) makes the dtype and the data
+     * inseparable, and lets every dtype-dependent method dispatch via an
+     * exhaustive {@code switch} the compiler checks. Array equality/hashing/
+     * printing lives here so callers don't reach back into raw arrays.
+     */
+    private sealed interface Storage {
+        DType dtype();
+        boolean dataEquals(Storage other);
+        int dataHashCode();
+        String dataString();
+    }
+
+    private record F32Storage(float[] data) implements Storage {
+        @Override public DType dtype() { return DType.FLOAT32; }
+        @Override public boolean dataEquals(Storage o) { return o instanceof F32Storage f && Arrays.equals(data, f.data); }
+        @Override public int dataHashCode() { return Arrays.hashCode(data); }
+        @Override public String dataString() { return Arrays.toString(data); }
+    }
+
+    private record F64Storage(double[] data) implements Storage {
+        @Override public DType dtype() { return DType.FLOAT64; }
+        @Override public boolean dataEquals(Storage o) { return o instanceof F64Storage f && Arrays.equals(data, f.data); }
+        @Override public int dataHashCode() { return Arrays.hashCode(data); }
+        @Override public String dataString() { return Arrays.toString(data); }
+    }
+
+    private record I32Storage(int[] data) implements Storage {
+        @Override public DType dtype() { return DType.INT32; }
+        @Override public boolean dataEquals(Storage o) { return o instanceof I32Storage f && Arrays.equals(data, f.data); }
+        @Override public int dataHashCode() { return Arrays.hashCode(data); }
+        @Override public String dataString() { return Arrays.toString(data); }
+    }
+
+    private record I64Storage(long[] data) implements Storage {
+        @Override public DType dtype() { return DType.INT64; }
+        @Override public boolean dataEquals(Storage o) { return o instanceof I64Storage f && Arrays.equals(data, f.data); }
+        @Override public int dataHashCode() { return Arrays.hashCode(data); }
+        @Override public String dataString() { return Arrays.toString(data); }
+    }
+
+    private record BoolStorage(boolean[] data) implements Storage {
+        @Override public DType dtype() { return DType.BOOL; }
+        @Override public boolean dataEquals(Storage o) { return o instanceof BoolStorage f && Arrays.equals(data, f.data); }
+        @Override public int dataHashCode() { return Arrays.hashCode(data); }
+        @Override public String dataString() { return Arrays.toString(data); }
+    }
+
+    /** Canonical constructor. Every public constructor funnels through here. */
+    private ConcreteNDArray(Storage storage, Shape shape, Device device) {
+        this.storage = storage;
         this.shape = shape;
-        this.dtype = dtype;
+        this.dtype = storage.dtype();
         this.device = device;
     }
 
     public ConcreteNDArray(float[] data, Shape shape, DType dtype, Device device) {
-        this(data, null, null, null, null, shape, requireFloat32Dtype(dtype), device);
+        this(f32Storage(data, dtype), shape, device);
     }
 
-    private static DType requireFloat32Dtype(DType dtype) {
+    private static F32Storage f32Storage(float[] data, DType dtype) {
         if (dtype != DType.FLOAT32) {
             throw new IllegalArgumentException("This constructor only accepts dtype FLOAT32, got " + dtype);
         }
-        return dtype;
+        return new F32Storage(data);
     }
 
     public ConcreteNDArray(float[] data, Shape shape) {
-        this(data, shape, DType.FLOAT32, Device.defaultDevice());
+        this(new F32Storage(data), shape, Device.defaultDevice());
     }
 
     public ConcreteNDArray(int[] data, Shape shape, Device device) {
-        this(null, data, null, null, null, shape, DType.INT32, device);
+        this(new I32Storage(data), shape, device);
     }
 
     public ConcreteNDArray(int[] data, Shape shape) {
-        this(data, shape, Device.defaultDevice());
+        this(new I32Storage(data), shape, Device.defaultDevice());
     }
 
     public ConcreteNDArray(boolean[] data, Shape shape, Device device) {
-        this(null, null, data, null, null, shape, DType.BOOL, device);
+        this(new BoolStorage(data), shape, device);
     }
 
     public ConcreteNDArray(boolean[] data, Shape shape) {
-        this(data, shape, Device.defaultDevice());
+        this(new BoolStorage(data), shape, Device.defaultDevice());
     }
 
     public ConcreteNDArray(double[] data, Shape shape, Device device) {
-        this(null, null, null, data, null, shape, DType.FLOAT64, device);
+        this(new F64Storage(data), shape, device);
     }
 
     public ConcreteNDArray(double[] data, Shape shape) {
-        this(data, shape, Device.defaultDevice());
+        this(new F64Storage(data), shape, Device.defaultDevice());
     }
 
     public ConcreteNDArray(long[] data, Shape shape, Device device) {
-        this(null, null, null, null, data, shape, DType.INT64, device);
+        this(new I64Storage(data), shape, device);
     }
 
     public ConcreteNDArray(long[] data, Shape shape) {
-        this(data, shape, Device.defaultDevice());
+        this(new I64Storage(data), shape, Device.defaultDevice());
     }
 
     @Override public Shape shape() { return shape; }

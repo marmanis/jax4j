@@ -750,26 +750,11 @@ public class ConcreteNDArray implements NDArray {
         if (this == o) return true;
         if (!(o instanceof ConcreteNDArray other)) return false;
         if (!shape.equals(other.shape) || dtype != other.dtype) return false;
-        return switch (dtype) {
-            case FLOAT32 -> Arrays.equals(floatData, other.floatData);
-            case INT32 -> Arrays.equals(intData, other.intData);
-            case BOOL -> Arrays.equals(boolData, other.boolData);
-            case FLOAT64 -> Arrays.equals(doubleData, other.doubleData);
-            case INT64 -> Arrays.equals(longData, other.longData);
-            default -> false;
-        };
+        return storage.dataEquals(other.storage);
     }
 
     @Override
     public int hashCode() {
-        int dataHash = switch (dtype) {
-            case FLOAT32 -> Arrays.hashCode(floatData);
-            case INT32 -> Arrays.hashCode(intData);
-            case BOOL -> Arrays.hashCode(boolData);
-            case FLOAT64 -> Arrays.hashCode(doubleData);
-            case INT64 -> Arrays.hashCode(longData);
-            default -> 0;
-        };
-        return dataHash * 31 + shape.hashCode();
+        return storage.dataHashCode() * 31 + shape.hashCode();
     }
 }

@@ -72,63 +72,273 @@ public final class Linalg {
      * vector has the same dtype and length {@code n}.
      *
      * <p>Throws {@link IllegalArgumentException} if the matrix is singular
-     * (all remaining pivots below {@code 1e-14 * ||A||_inf}) — no
-     * least-squares fallback, no regularisation.
+     * under the default {@link SingularityCheck#SINGULARITY_CHECK_SUBMATRIX_MAX}
+     * criterion — no least-squares fallback, no regularisation.
+     *
+     * <p>Equivalent to {@code lu(A).solve(b)}. When solving multiple
+     * right-hand sides against the same matrix, call {@link #lu(NDArray)}
+     * once and reuse the returned {@link LU} — the O(n³) factorisation is
+     * paid once, each subsequent {@link LU#solve} is O(n²).
      */
     public static NDArray solve(NDArray A, NDArray b) {
-        int n = requireSquareAndVector(A, b);
+        return solve(A, b, SingularityCheck.SINGULARITY_CHECK_SUBMATRIX_MAX);
+    }
+
+    /**
+     * Same as {@link #solve(NDArray, NDArray)} but with an explicit
+     * {@link SingularityCheck} controlling when {@code A} is rejected as
+     * too close to singular to solve.
+     */
+    public static NDArray solve(NDArray A, NDArray b, SingularityCheck check) {
         if (A.dtype() != b.dtype()) {
             throw new IllegalArgumentException(
                 "solve requires matching dtypes: " + A.dtype() + " vs " + b.dtype());
         }
-        if (A.dtype() == DType.FLOAT64) {
-            double[] aData = A.toDoubleArray().clone();
-            double[] bData = b.toDoubleArray().clone();
-            double[] x = luSolveDouble(aData, bData, n);
-            return new ConcreteNDArray(x, new Shape(n));
-        }
-        if (A.dtype() == DType.FLOAT32) {
-            // Promote to double for stability, cast back on exit — the extra
-            // work is negligible next to the O(n^3) elimination and buys us
-            // meaningful accuracy on ill-conditioned systems.
-            double[] aData = new double[n * n];
-            double[] bData = new double[n];
-            float[] aSrc = A.toFloatArray();
-            float[] bSrc = b.toFloatArray();
-            for (int i = 0; i < n * n; i++) aData[i] = aSrc[i];
-            for (int i = 0; i < n; i++) bData[i] = bSrc[i];
-            double[] xD = luSolveDouble(aData, bData, n);
-            float[] x = new float[n];
-            for (int i = 0; i < n; i++) x[i] = (float) xD[i];
-            return new ConcreteNDArray(x, new Shape(n));
-        }
-        throw new IllegalArgumentException("solve requires FLOAT32 or FLOAT64, got " + A.dtype());
+        return lu(A, check).solve(b);
     }
 
-    private static int requireSquareAndVector(NDArray A, NDArray b) {
+    /**
+     * LU factorisation of a square matrix, cached for repeated back-
+     * substitution against multiple right-hand sides. The factorisation is
+     * always stored in FLOAT64 for numerical stability, independent of the
+     * input matrix's dtype; each {@link #solve} returns a vector matching
+     * <em>the RHS's</em> dtype (FLOAT32 in gives FLOAT32 out, FLOAT64 in
+     * gives FLOAT64 out).
+     *
+     * <p>Represents {@code P A = L U}, where {@code L} is unit-lower-
+     * triangular and {@code U} is upper-triangular, packed together in a
+     * single {@code n × n} array (Doolittle form: {@code L}'s strict lower
+     * triangle overlays the eliminated positions, {@code U} occupies the
+     * diagonal and above). The row permutation {@code P} is stored as an
+     * integer vector giving, for each row of the factored matrix, the row
+     * of the original {@code A} it corresponds to.
+     */
+    public static final class LU {
+        private final double[] lu;
+        private final int[] piv;
+        private final int n;
+        // ||A||_∞ (row-sum norm) of the pre-factorisation matrix, retained
+        // so that Linalg.cond and the RECIPROCAL_CONDITION_EST post-check
+        // can compute rcond without needing the caller to hold onto A.
+        private final double origInfNorm;
+
+        private LU(double[] lu, int[] piv, int n, double origInfNorm) {
+            this.lu = lu;
+            this.piv = piv;
+            this.n = n;
+            this.origInfNorm = origInfNorm;
+        }
+
+        /** Order of the factored matrix. */
+        public int n() { return n; }
+
+        /**
+         * Solve {@code A x = b} using this cached factorisation. {@code b}
+         * must be a length-{@code n} vector of {@code FLOAT32} or
+         * {@code FLOAT64} dtype. The returned vector matches {@code b}'s
+         * dtype.
+         */
+        public NDArray solve(NDArray b) {
+            if (b.shape().rank() != 1 || b.shape().dimensions()[0] != n) {
+                throw new IllegalArgumentException(
+                    "LU.solve: b must be length-" + n + " vector, got shape " + b.shape());
+            }
+            if (b.dtype() == DType.FLOAT64) {
+                double[] x = substitute(b.toDoubleArray());
+                return new ConcreteNDArray(x, new Shape(n));
+            }
+            if (b.dtype() == DType.FLOAT32) {
+                float[] src = b.toFloatArray();
+                double[] bD = new double[n];
+                for (int i = 0; i < n; i++) bD[i] = src[i];
+                double[] xD = substitute(bD);
+                float[] x = new float[n];
+                for (int i = 0; i < n; i++) x[i] = (float) xD[i];
+                return new ConcreteNDArray(x, new Shape(n));
+            }
+            throw new IllegalArgumentException(
+                "LU.solve requires FLOAT32 or FLOAT64 RHS, got " + b.dtype());
+        }
+
+        /**
+         * Solve {@code A x = b} using this cached factorisation on a raw
+         * {@code double[]} RHS, returning a fresh {@code double[]}. Zero
+         * NDArray allocation — useful for tight inner loops (e.g. inverse
+         * iteration).
+         */
+        public double[] solve(double[] b) {
+            if (b.length != n) {
+                throw new IllegalArgumentException(
+                    "LU.solve: b length must be " + n + ", got " + b.length);
+            }
+            return substitute(b);
+        }
+
+        private double[] substitute(double[] b) {
+            // Apply the row permutation P: y[i] = b[piv[i]].
+            double[] y = new double[n];
+            for (int i = 0; i < n; i++) y[i] = b[piv[i]];
+            // Forward-substitute L y = P b. L has a unit diagonal, so no
+            // divide is needed.
+            for (int i = 0; i < n; i++) {
+                double s = y[i];
+                for (int j = 0; j < i; j++) s -= lu[i * n + j] * y[j];
+                y[i] = s;
+            }
+            // Back-substitute U x = y.
+            double[] x = new double[n];
+            for (int i = n - 1; i >= 0; i--) {
+                double s = y[i];
+                for (int j = i + 1; j < n; j++) s -= lu[i * n + j] * x[j];
+                x[i] = s / lu[i * n + i];
+            }
+            return x;
+        }
+
+        /**
+         * Solve {@code A^T x = b} using this factorisation. Package-private:
+         * used by {@link Linalg#cond} inside Hager's iteration, which
+         * alternates between {@code A^{-1}} and {@code A^{-T}}. Since
+         * {@code P A = L U}, {@code A^T = U^T L^T P}, so
+         * {@code A^{-T} = P^{-1} L^{-T} U^{-T}}.
+         */
+        double[] solveTranspose(double[] b) {
+            if (b.length != n) {
+                throw new IllegalArgumentException(
+                    "LU.solveTranspose: b length must be " + n + ", got " + b.length);
+            }
+            // Step 1: solve U^T y = b (U^T is lower-triangular, so forward-sub).
+            double[] y = new double[n];
+            for (int i = 0; i < n; i++) {
+                double s = b[i];
+                for (int j = 0; j < i; j++) s -= lu[j * n + i] * y[j];
+                y[i] = s / lu[i * n + i];
+            }
+            // Step 2: solve L^T w = y (L^T is upper-triangular with unit
+            // diagonal, so back-sub with no divide).
+            double[] w = new double[n];
+            for (int i = n - 1; i >= 0; i--) {
+                double s = y[i];
+                for (int j = i + 1; j < n; j++) s -= lu[j * n + i] * w[j];
+                w[i] = s;
+            }
+            // Step 3: apply P^{-1}, i.e. z[piv[i]] = w[i].
+            double[] z = new double[n];
+            for (int i = 0; i < n; i++) z[piv[i]] = w[i];
+            return z;
+        }
+    }
+
+    /**
+     * LU factorisation of a square {@code A} with partial pivoting.
+     * Accepts {@code FLOAT32} or {@code FLOAT64}; factorisation is always
+     * computed in FLOAT64 for stability. The returned {@link LU} can be
+     * used to solve any number of systems {@code A x = b} at O(n²) per
+     * RHS, amortising the O(n³) factorisation.
+     *
+     * <p>Uses the default
+     * {@link SingularityCheck#SINGULARITY_CHECK_SUBMATRIX_MAX} — throws
+     * {@link IllegalArgumentException} if any pivot falls below
+     * {@code 1e-14 × ‖A‖_max}.
+     */
+    public static LU lu(NDArray A) {
+        return lu(A, SingularityCheck.SINGULARITY_CHECK_SUBMATRIX_MAX);
+    }
+
+    /**
+     * LU factorisation with an explicit {@link SingularityCheck}
+     * controlling when {@code A} is rejected as too close to singular.
+     * See {@link SingularityCheck} for a description of each mode.
+     */
+    public static LU lu(NDArray A, SingularityCheck check) {
+        LU factorization = factorFromNDArray(A, check);
+        if (check == SingularityCheck.SINGULARITY_CHECK_RECIPROCAL_CONDITION_EST) {
+            double rcond = reciprocalConditionNumber(factorization);
+            if (rcond < RCOND_TOL) {
+                throw new IllegalArgumentException(
+                    "lu: matrix is ill-conditioned (rcond ≈ " + rcond
+                        + " < " + RCOND_TOL + ", so κ_∞ ≳ " + (1.0 / RCOND_TOL) + ")");
+            }
+        }
+        return factorization;
+    }
+
+    /**
+     * Estimate the ∞-norm condition number
+     * {@code κ_∞(A) = ‖A‖_∞ · ‖A⁻¹‖_∞} via Hager's algorithm — the same
+     * technique LAPACK's {@code DGECON} uses to power its condition
+     * warnings. Value is a lower-bound estimate (typically within a small
+     * factor of the true κ); values much larger than {@code 1e14} indicate
+     * that {@code A} is effectively singular in double precision.
+     *
+     * <p>Returns {@link Double#POSITIVE_INFINITY} if {@code A} has an
+     * exact-zero pivot (structurally singular). Never throws for
+     * ill-conditioning: the point of this method is to report κ, not to
+     * gate anything on it.
+     */
+    public static double cond(NDArray A) {
+        LU factorization;
+        try {
+            // Factor without any conditioning gate — we want cond() to
+            // report κ for any matrix whose factorisation doesn't NaN out,
+            // however ill-conditioned. Only structural (exact-zero-pivot)
+            // singularity is unhandleable here.
+            factorization = factorFromNDArray(A,
+                SingularityCheck.SINGULARITY_CHECK_RECIPROCAL_CONDITION_EST);
+        } catch (IllegalArgumentException e) {
+            return Double.POSITIVE_INFINITY;
+        }
+        return cond(factorization);
+    }
+
+    /**
+     * Condition-number estimate against an already-computed factorisation.
+     * Use when you've already paid the O(n³) LU cost — {@code Chebop} does
+     * this to report the condition number of a discretised operator without
+     * re-factorising the collocation matrix. Same estimate and same return
+     * conventions as {@link #cond(NDArray)}.
+     */
+    public static double cond(LU lu) {
+        double rcond = reciprocalConditionNumber(lu);
+        if (rcond == 0.0 || !Double.isFinite(rcond)) return Double.POSITIVE_INFINITY;
+        return 1.0 / rcond;
+    }
+
+    /**
+     * Shared plumbing: validate {@code A}'s shape and dtype, copy to a
+     * FLOAT64 backing array, and call {@link #luFactorInPlace} with the
+     * chosen per-step check. Used by both {@link #lu(NDArray, SingularityCheck)}
+     * and {@link #cond(NDArray)}.
+     */
+    private static LU factorFromNDArray(NDArray A, SingularityCheck check) {
         if (A.shape().rank() != 2) {
-            throw new IllegalArgumentException("solve: A must be 2-D, got shape " + A.shape());
+            throw new IllegalArgumentException("lu: A must be 2-D, got shape " + A.shape());
         }
         int n = A.shape().dimensions()[0];
         if (A.shape().dimensions()[1] != n) {
-            throw new IllegalArgumentException("solve: A must be square, got shape " + A.shape());
+            throw new IllegalArgumentException("lu: A must be square, got shape " + A.shape());
         }
-        if (b.shape().rank() != 1 || b.shape().dimensions()[0] != n) {
-            throw new IllegalArgumentException(
-                "solve: b must be length-" + n + " vector, got shape " + b.shape());
+        double[] aData;
+        if (A.dtype() == DType.FLOAT64) {
+            aData = A.toDoubleArray().clone();
+        } else if (A.dtype() == DType.FLOAT32) {
+            aData = floatToDouble(A.toFloatArray());
+        } else {
+            throw new IllegalArgumentException("lu requires FLOAT32 or FLOAT64, got " + A.dtype());
         }
-        return n;
+        return luFactorInPlace(aData, n, check);
     }
 
     /**
      * Generalized eigenvalues of the pair {@code (A, B)} — the values
      * {@code lambda} such that {@code A x = lambda B x} has a nonzero
-     * solution {@code x}. MVP reduces to the standard eigenvalue problem
-     * {@code C x = lambda x} with {@code C = B^{-1} A}, computed by
-     * {@link #solve} on each column of {@code A}. Requires {@code B} to be
-     * non-singular; symmetric-positive-definite {@code B} would admit a
-     * Cholesky-based path that's numerically better, but the MVP takes the
-     * general route.
+     * solution {@code x}. Reduces to the standard eigenvalue problem
+     * {@code C x = lambda x} with {@code C = B^{-1} A}: factor {@code B}
+     * once via {@link #lu(NDArray)}, then back-substitute against every
+     * column of {@code A} to build {@code C} at O(n³) total. Requires
+     * {@code B} to be non-singular; symmetric-positive-definite {@code B}
+     * would admit a Cholesky-based path that's numerically better, but
+     * this route is fine for the sizes chebop needs.
      *
      * @return length-2 array {@code {real, imag}} of the n eigenvalues.
      */
@@ -141,21 +351,15 @@ public final class Linalg {
         double[] Adata = (A.dtype() == DType.FLOAT64)
             ? A.toDoubleArray()
             : floatToDouble(A.toFloatArray());
-        double[] Bdata = (B.dtype() == DType.FLOAT64)
-            ? B.toDoubleArray().clone()
-            : floatToDouble(B.toFloatArray());
-        // C = B^{-1} A: for each column j of A, solve B c_j = a_j; then
-        // C is the matrix whose j-th column is c_j. Bdata is modified in
-        // place by luSolveDouble, so we re-factor by passing a fresh copy
-        // to each solve — cost is O(n^3) per solve times n = O(n^4). Fine
-        // for the small colleague-adjacent sizes chebop needs; a shared LU
-        // factorization would drop this to O(n^3) total.
+        // Factor B once. Each column of C = B^{-1} A is then one O(n^2)
+        // back-substitution — total O(n^3) instead of the O(n^4) you'd
+        // pay if you re-factored B for every column.
+        LU Blu = lu(B);
         double[] Cdata = new double[n * n];
+        double[] col = new double[n];
         for (int j = 0; j < n; j++) {
-            double[] col = new double[n];
             for (int i = 0; i < n; i++) col[i] = Adata[i * n + j];
-            double[] Bcopy = Bdata.clone();
-            double[] cj = luSolveDouble(Bcopy, col, n);
+            double[] cj = Blu.solve(col);
             for (int i = 0; i < n; i++) Cdata[i * n + j] = cj[i];
         }
         NDArray C = new ConcreteNDArray(Cdata, new Shape(n, n));

@@ -2,10 +2,12 @@ package com.marmanis.jax4j;
 
 import com.marmanis.jax4j.api.Linalg;
 import com.marmanis.jax4j.core.ConcreteNDArray;
+import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.Shape;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**

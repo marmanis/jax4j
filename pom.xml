@@ -74,6 +74,26 @@
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
                 <configuration>
+                    <argLine>
+                        -server
+                        -XX:+UnlockExperimentalVMOptions
+                        -XX:+EnableJVMCI
+                        --enable-preview
+                        -Djava.library.path=${env.TORNADOVM_HOME}/lib
+                        -Dtornado.load.api.implementation=uk.ac.manchester.tornado.runtime.tasks.TornadoTaskGraph
+                        -Dtornado.load.runtime.implementation=uk.ac.manchester.tornado.runtime.TornadoCoreRuntime
+                        -Dtornado.load.tornado.implementation=uk.ac.manchester.tornado.runtime.common.Tornado
+                        -Dtornado.load.annotation.implementation=uk.ac.manchester.tornado.annotation.ASMClassVisitor
+                        -Dtornado.load.annotation.parallel=uk.ac.manchester.tornado.api.annotations.Parallel
+                        --upgrade-module-path=${env.TORNADOVM_HOME}/share/java/graalJars
+                        -XX:+UseParallelGC
+                        @${env.TORNADOVM_HOME}/etc/exportLists/common-exports
+                        @${env.TORNADOVM_HOME}/etc/exportLists/opencl-exports
+                        @${env.TORNADOVM_HOME}/etc/exportLists/ptx-exports
+                        --enable-native-access=tornado.drivers.opencl,tornado.drivers.ptx
+                        --add-modules=ALL-SYSTEM,tornado.runtime,tornado.annotation,tornado.drivers.common,tornado.drivers.opencl,tornado.drivers.ptx
+                        --module-path=${env.TORNADOVM_HOME}/share/java/tornado
+                    </argLine>
                 </configuration>
             </plugin>
             <plugin>

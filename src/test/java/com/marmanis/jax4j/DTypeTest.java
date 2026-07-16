@@ -127,10 +127,17 @@ public class DTypeTest {
     // ---- arithmetic dtype guard ----
 
     @Test
-    void arithmeticOnNonFloatThrows() {
+    void arithmeticOnNonFloatPromotes() {
+        NDArray result = bools(true, false).add(floats(1f, 2f));
+        assertEquals(DType.FLOAT32, result.dtype());
+        assertArrayEquals(new float[]{2f, 2f}, result.toFloatArray(), 1e-6f);
+    }
+
+    @Test
+    void arithmeticOnNonFloatingPromotedTypeThrows() {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
-            () -> bools(true, false).add(floats(1f, 2f)));
-        assertTrue(e.getMessage().contains("astype"));
+            () -> ints(1).add(ints(1)));
+        assertTrue(e.getMessage().contains("requires FLOAT32 or FLOAT64"));
     }
 
     @Test
@@ -147,8 +154,10 @@ public class DTypeTest {
     // ---- comparisons ----
 
     @Test
-    void comparisonDtypeMismatchThrows() {
-        assertThrows(IllegalArgumentException.class, () -> floats(1f).gt(ints(1)));
+    void comparisonDtypeMismatchPromotes() {
+        NDArray result = floats(1f).gt(ints(1));
+        assertEquals(DType.BOOL, result.dtype());
+        assertArrayEquals(new boolean[]{false}, result.toBoolArray());
     }
 
     @Test
@@ -273,10 +282,10 @@ public class DTypeTest {
     }
 
     @Test
-    void float32AndFloat64ArithmeticMixDisallowed() {
-        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
-            () -> floats(1f).add(doubles(1.0)));
-        assertTrue(e.getMessage().contains("astype"));
+    void float32AndFloat64ArithmeticMixPromotes() {
+        NDArray result = floats(1f).add(doubles(1.0));
+        assertEquals(DType.FLOAT64, result.dtype());
+        assertArrayEquals(new double[]{2.0}, result.toDoubleArray(), 1e-12);
     }
 
     @Test

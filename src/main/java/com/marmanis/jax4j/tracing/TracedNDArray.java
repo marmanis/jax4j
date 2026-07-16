@@ -60,13 +60,39 @@ public class TracedNDArray implements NDArray {
         return new TracedNDArray(outVar);
     }
 
-    @Override public NDArray add(NDArray other) { return applyPrimitive(Primitive.ADD, List.of(this, other), Shape.broadcast(shape(), other.shape())); }
-    @Override public NDArray sub(NDArray other) { return applyPrimitive(Primitive.SUB, List.of(this, other), Shape.broadcast(shape(), other.shape())); }
-    @Override public NDArray mul(NDArray other) { return applyPrimitive(Primitive.MUL, List.of(this, other), Shape.broadcast(shape(), other.shape())); }
-    @Override public NDArray div(NDArray other) { return applyPrimitive(Primitive.DIV, List.of(this, other), Shape.broadcast(shape(), other.shape())); }
+    private NDArray elementwise(NDArray other, Primitive primitive, java.util.function.BiFunction<NDArray, NDArray, NDArray> tracedOp) {
+        if (dtype() != other.dtype()) {
+            DType target = DType.promote(this.dtype(), other.dtype());
+            NDArray left = (this.dtype() == target) ? this : this.astype(target);
+            NDArray right = (other.dtype() == target) ? other : other.astype(target);
+            return tracedOp.apply(left, right);
+        }
+        return applyPrimitive(primitive, List.of(this, other), Shape.broadcast(shape(), other.shape()));
+    }
+
+    private NDArray compareElementwise(NDArray other, Primitive primitive, DType outDtype, java.util.function.BiFunction<NDArray, NDArray, NDArray> tracedOp) {
+        if (dtype() != other.dtype()) {
+            DType target = DType.promote(this.dtype(), other.dtype());
+            NDArray left = (this.dtype() == target) ? this : this.astype(target);
+            NDArray right = (other.dtype() == target) ? other : other.astype(target);
+            return tracedOp.apply(left, right);
+        }
+        return applyPrimitive(primitive, List.of(this, other), Shape.broadcast(shape(), other.shape()), outDtype, null);
+    }
+
+    @Override public NDArray add(NDArray other) { return elementwise(other, Primitive.ADD, NDArray::add); }
+    @Override public NDArray sub(NDArray other) { return elementwise(other, Primitive.SUB, NDArray::sub); }
+    @Override public NDArray mul(NDArray other) { return elementwise(other, Primitive.MUL, NDArray::mul); }
+    @Override public NDArray div(NDArray other) { return elementwise(other, Primitive.DIV, NDArray::div); }
 
     @Override
     public NDArray dot(NDArray other) {
+        if (dtype() != other.dtype()) {
+            DType target = DType.promote(this.dtype(), other.dtype());
+            NDArray left = (this.dtype() == target) ? this : this.astype(target);
+            NDArray right = (other.dtype() == target) ? other : other.astype(target);
+            return left.dot(right);
+        }
         Shape outShape = new Shape(shape().dimensions()[0], other.shape().dimensions()[1]);
         return applyPrimitive(Primitive.DOT, List.of(this, other), outShape);
     }
@@ -95,15 +121,15 @@ public class TracedNDArray implements NDArray {
         return applyPrimitive(Primitive.MEAN_AXIS, List.of(this), shape().reduceAxis(norm, keepDims), new AxisMeta(norm, keepDims));
     }
 
-    @Override public NDArray gt(NDArray other) { return applyPrimitive(Primitive.GT, List.of(this, other), Shape.broadcast(shape(), other.shape()), DType.BOOL, null); }
-    @Override public NDArray ge(NDArray other) { return applyPrimitive(Primitive.GE, List.of(this, other), Shape.broadcast(shape(), other.shape()), DType.BOOL, null); }
-    @Override public NDArray lt(NDArray other) { return applyPrimitive(Primitive.LT, List.of(this, other), Shape.broadcast(shape(), other.shape()), DType.BOOL, null); }
-    @Override public NDArray le(NDArray other) { return applyPrimitive(Primitive.LE, List.of(this, other), Shape.broadcast(shape(), other.shape()), DType.BOOL, null); }
-    @Override public NDArray eq(NDArray other) { return applyPrimitive(Primitive.EQ, List.of(this, other), Shape.broadcast(shape(), other.shape()), DType.BOOL, null); }
-    @Override public NDArray ne(NDArray other) { return applyPrimitive(Primitive.NE, List.of(this, other), Shape.broadcast(shape(), other.shape()), DType.BOOL, null); }
+    @Override public NDArray gt(NDArray other) { return compareElementwise(other, Primitive.GT, DType.BOOL, NDArray::gt); }
+    @Override public NDArray ge(NDArray other) { return compareElementwise(other, Primitive.GE, DType.BOOL, NDArray::ge); }
+    @Override public NDArray lt(NDArray other) { return compareElementwise(other, Primitive.LT, DType.BOOL, NDArray::lt); }
+    @Override public NDArray le(NDArray other) { return compareElementwise(other, Primitive.LE, DType.BOOL, NDArray::le); }
+    @Override public NDArray eq(NDArray other) { return compareElementwise(other, Primitive.EQ, DType.BOOL, NDArray::eq); }
+    @Override public NDArray ne(NDArray other) { return compareElementwise(other, Primitive.NE, DType.BOOL, NDArray::ne); }
 
-    @Override public NDArray max(NDArray other) { return applyPrimitive(Primitive.MAX, List.of(this, other), Shape.broadcast(shape(), other.shape())); }
-    @Override public NDArray min(NDArray other) { return applyPrimitive(Primitive.MIN, List.of(this, other), Shape.broadcast(shape(), other.shape())); }
+    @Override public NDArray max(NDArray other) { return elementwise(other, Primitive.MAX, NDArray::max); }
+    @Override public NDArray min(NDArray other) { return elementwise(other, Primitive.MIN, NDArray::min); }
 
     @Override
     public NDArray argmax(int axis) {

@@ -218,7 +218,17 @@ public class ConcreteNDArray implements NDArray {
      */
     private NDArray elementwise(NDArray other, Primitive primitive, DoubleBinaryOperator op,
                                  java.util.function.BiFunction<NDArray, NDArray, NDArray> tracedOp) {
-        if (other instanceof TracedNDArray || isTracing()) return tracedOp.apply(toTraced(), other);
+        if (dtype != other.dtype() || other instanceof TracedNDArray || isTracing()) {
+            DType target = DType.promote(this.dtype(), other.dtype());
+            NDArray left = (this.dtype() == target) ? this : this.astype(target);
+            NDArray right = (other.dtype() == target) ? other : other.astype(target);
+            if (left instanceof TracedNDArray || right instanceof TracedNDArray || isTracing()) {
+                NDArray leftTraced = left instanceof TracedNDArray ? left : ((ConcreteNDArray) left).toTraced();
+                NDArray rightTraced = right instanceof TracedNDArray ? right : ((ConcreteNDArray) right).toTraced();
+                return tracedOp.apply(leftTraced, rightTraced);
+            }
+            return ((ConcreteNDArray) left).elementwise(right, primitive, op, tracedOp);
+        }
 
         requireSameFloatingDtype(other, primitive.toString());
 
@@ -318,12 +328,16 @@ public class ConcreteNDArray implements NDArray {
     private NDArray compareElementwise(NDArray other, Primitive primitive,
                                         java.util.function.BiPredicate<Double, Double> test,
                                         java.util.function.BiFunction<NDArray, NDArray, NDArray> tracedOp) {
-        if (other instanceof TracedNDArray || isTracing()) return tracedOp.apply(toTraced(), other);
-
-        if (dtype != other.dtype()) {
-            throw new IllegalArgumentException(
-                primitive + " requires both operands to share a dtype, got " + dtype + " and " + other.dtype()
-                    + " — use .astype() to convert.");
+        if (dtype != other.dtype() || other instanceof TracedNDArray || isTracing()) {
+            DType target = DType.promote(this.dtype(), other.dtype());
+            NDArray left = (this.dtype() == target) ? this : this.astype(target);
+            NDArray right = (other.dtype() == target) ? other : other.astype(target);
+            if (left instanceof TracedNDArray || right instanceof TracedNDArray || isTracing()) {
+                NDArray leftTraced = left instanceof TracedNDArray ? left : ((ConcreteNDArray) left).toTraced();
+                NDArray rightTraced = right instanceof TracedNDArray ? right : ((ConcreteNDArray) right).toTraced();
+                return tracedOp.apply(leftTraced, rightTraced);
+            }
+            return ((ConcreteNDArray) left).compareElementwise(right, primitive, test, tracedOp);
         }
 
         Shape outShape = Shape.broadcast(shape, other.shape());
@@ -391,8 +405,17 @@ public class ConcreteNDArray implements NDArray {
 
     @Override
     public NDArray dot(NDArray other) {
-        if (other instanceof TracedNDArray) return toTraced().dot(other);
-        if (isTracing()) return toTraced().dot(other);
+        if (dtype != other.dtype() || other instanceof TracedNDArray || isTracing()) {
+            DType target = DType.promote(this.dtype(), other.dtype());
+            NDArray left = (this.dtype() == target) ? this : this.astype(target);
+            NDArray right = (other.dtype() == target) ? other : other.astype(target);
+            if (left instanceof TracedNDArray || right instanceof TracedNDArray || isTracing()) {
+                NDArray leftTraced = left instanceof TracedNDArray ? left : ((ConcreteNDArray) left).toTraced();
+                NDArray rightTraced = right instanceof TracedNDArray ? right : ((ConcreteNDArray) right).toTraced();
+                return leftTraced.dot(rightTraced);
+            }
+            return ((ConcreteNDArray) left).dot(right);
+        }
         requireSameFloatingDtype(other, "dot");
         int M = shape.dimensions()[0];
         int K = shape.dimensions()[1];

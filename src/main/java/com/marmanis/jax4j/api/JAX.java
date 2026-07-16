@@ -54,6 +54,17 @@ public class JAX {
     }
 
     /**
+     * Computes the Jacobian-Vector Product (JVP) / forward-mode autodiff.
+     * Propagates primals and tangents forward through the function.
+     * Returns a 2-element array: [primal_out, tangent_out].
+     */
+    public static NDArray[] jvp(Function<NDArray, NDArray> fn, NDArray arg, NDArray tangent) {
+        Jaxpr jaxpr = make_jaxpr(fn, arg);
+        Grad.ForwardAdResult result = Grad.forwardAd(jaxpr, List.of(arg), List.of(tangent));
+        return new NDArray[]{result.primals().get(0), result.tangents().get(0)};
+    }
+
+    /**
      * Wraps {@code fn} so it is traced once per distinct input signature
      * (shape + dtype) and re-executed via {@link Grad#forwardInterpret}
      * on subsequent calls. Repeated invocations with the same signature

@@ -463,30 +463,26 @@ public class ConcreteNDArray implements NDArray {
     @Override public NDArray sum() {
         if (isTracing()) return toTraced().sum();
         requireFloatingDtype("sum");
+        ExecutionBackend backend = backendFor(device);
         if (dtype == DType.FLOAT64) {
-            double sum = 0;
-            for (double v : f64()) sum += v;
-            return new ConcreteNDArray(new double[]{sum}, new Shape(1), device);
+            double[] res = backend.reduce(Primitive.SUM, f64(), device);
+            return new ConcreteNDArray(res, new Shape(1), device);
         }
-        float sum = 0;
-        for (float v : f32()) sum += v;
-        return new ConcreteNDArray(new float[]{sum}, new Shape(1), dtype, device);
+        float[] res = backend.reduce(Primitive.SUM, f32(), device);
+        return new ConcreteNDArray(res, new Shape(1), dtype, device);
     }
 
     @Override
     public NDArray mean() {
         if (isTracing()) return toTraced().mean();
         requireFloatingDtype("mean");
+        ExecutionBackend backend = backendFor(device);
         if (dtype == DType.FLOAT64) {
-            double[] data = f64();
-            double sum = 0;
-            for (double v : data) sum += v;
-            return new ConcreteNDArray(new double[]{sum / data.length}, new Shape(1), device);
+            double[] res = backend.reduce(Primitive.MEAN, f64(), device);
+            return new ConcreteNDArray(res, new Shape(1), device);
         }
-        float[] data = f32();
-        float sum = 0;
-        for (float v : data) sum += v;
-        return new ConcreteNDArray(new float[]{sum / data.length}, new Shape(1), dtype, device);
+        float[] res = backend.reduce(Primitive.MEAN, f32(), device);
+        return new ConcreteNDArray(res, new Shape(1), dtype, device);
     }
 
     @Override

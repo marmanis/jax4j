@@ -31,21 +31,54 @@ public class GradTest {
     }
 
     @Test
-    public void testComposeGrad() {
-        // f(x) = x * x
-        // g(x) = f(f(x)) = x^4
-        // g'(x) = 4x^3
-        Function<NDArray, NDArray> f = x -> x.mul(x);
-        Function<NDArray, NDArray> g = x -> f.apply(f.apply(x));
-        
-        Function<NDArray, NDArray> gradG = JAX.grad(g);
-        
-        // x = 2.0
-        NDArray arg = new ConcreteNDArray(new float[]{2.0f}, new Shape(1));
-        NDArray grad = gradG.apply(arg);
-        
-        // g'(2) = 4 * 2^3 = 4 * 8 = 32.0
-        float[] result = grad.toFloatArray();
-        assertEquals(32.0f, result[0], 1e-5);
+    public void testSimpleJvp() {
+        // f(x) = x * x + x
+        // f'(x) = 2x + 1
+        Function<NDArray, NDArray> fn = x -> x.mul(x).add(x);
+
+        // x = 3.0, tangent = 1.5
+        NDArray arg = new ConcreteNDArray(new float[]{3.0f}, new Shape(1));
+        NDArray tangent = new ConcreteNDArray(new float[]{1.5f}, new Shape(1));
+
+        NDArray[] out = JAX.jvp(fn, arg, tangent);
+
+        // primal = f(3) = 12.0
+        assertArrayEquals(new float[]{12.0f}, out[0].toFloatArray(), 1e-5f);
+        // tangent = f'(3) * 1.5 = (2 * 3 + 1) * 1.5 = 10.5
+        assertArrayEquals(new float[]{10.5f}, out[1].toFloatArray(), 1e-5f);
+    }
+
+    @Test
+    public void testSinJvp() {
+        // f(x) = sin(x)
+        // f'(x) = cos(x)
+        Function<NDArray, NDArray> fn = NDArray::sin;
+
+        // x = 0.0, tangent = 2.0
+        NDArray arg = new ConcreteNDArray(new float[]{0.0f}, new Shape(1));
+        NDArray tangent = new ConcreteNDArray(new float[]{2.0f}, new Shape(1));
+
+        NDArray[] out = JAX.jvp(fn, arg, tangent);
+
+        assertArrayEquals(new float[]{0.0f}, out[0].toFloatArray(), 1e-5f);
+        assertArrayEquals(new float[]{2.0f}, out[1].toFloatArray(), 1e-5f);
+    }
+
+    @Test
+    public void testDotJvp() {
+        // Matrix multiplication JVP
+        // f(X) = X . X
+        // d(X.X) = X_t.X + X.X_t
+        Function<NDArray, NDArray> fn = x -> x.dot(x);
+
+        NDArray arg = new ConcreteNDArray(new float[]{1f, 2f, 3f, 4f}, new Shape(2, 2));
+        NDArray tangent = new ConcreteNDArray(new float[]{1f, 0f, 0f, 1f}, new Shape(2, 2)); // Identity matrix
+
+        NDArray[] out = JAX.jvp(fn, arg, tangent);
+
+        // primal = X.X = [7, 10, 15, 22]
+        assertArrayEquals(new float[]{7f, 10f, 15f, 22f}, out[0].toFloatArray(), 1e-5f);
+        // tangent = I.X + X.I = 2 * X = [2, 4, 6, 8]
+        assertArrayEquals(new float[]{2f, 4f, 6f, 8f}, out[1].toFloatArray(), 1e-5f);
     }
 }

@@ -8,6 +8,7 @@ import uk.ac.manchester.tornado.api.ImmutableTaskGraph;
 import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
 import uk.ac.manchester.tornado.api.annotations.Parallel;
+import uk.ac.manchester.tornado.api.annotations.Reduce;
 import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 
 /**
@@ -93,6 +94,58 @@ public class TornadoVMBackend implements ExecutionBackend {
         } catch (Throwable t) {
             log.warn("TornadoVM execution failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
             return HostBackend.INSTANCE.unary(primitive, a, device);
+        }
+    }
+
+    @Override
+    public float[] reduce(Primitive primitive, float[] a, Device device) {
+        float[] out = new float[1];
+        try {
+            TaskGraph tg = new TaskGraph("jax4j_reduce_" + primitive)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a);
+            tg = switch (primitive) {
+                case SUM, MEAN -> tg.task("k", TornadoVMBackend::reduceSum, a, out);
+                default -> throw new UnsupportedOperationException("No TornadoVM reduction kernel for " + primitive);
+            };
+            tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
+
+            ImmutableTaskGraph itg = tg.snapshot();
+            try (TornadoExecutionPlan plan = configuredPlan(itg, device)) {
+                plan.execute();
+            }
+            if (primitive == Primitive.MEAN) {
+                out[0] /= a.length;
+            }
+            return out;
+        } catch (Throwable t) {
+            log.warn("TornadoVM reduction failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
+            return HostBackend.INSTANCE.reduce(primitive, a, device);
+        }
+    }
+
+    @Override
+    public double[] reduce(Primitive primitive, double[] a, Device device) {
+        double[] out = new double[1];
+        try {
+            TaskGraph tg = new TaskGraph("jax4j_reduce_" + primitive + "_d")
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a);
+            tg = switch (primitive) {
+                case SUM, MEAN -> tg.task("k", TornadoVMBackend::reduceSumD, a, out);
+                default -> throw new UnsupportedOperationException("No TornadoVM FP64 reduction kernel for " + primitive);
+            };
+            tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
+
+            ImmutableTaskGraph itg = tg.snapshot();
+            try (TornadoExecutionPlan plan = configuredPlan(itg, device)) {
+                plan.execute();
+            }
+            if (primitive == Primitive.MEAN) {
+                out[0] /= a.length;
+            }
+            return out;
+        } catch (Throwable t) {
+            log.warn("TornadoVM FP64 reduction failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
+            return HostBackend.INSTANCE.reduce(primitive, a, device);
         }
     }
 
@@ -321,6 +374,18 @@ public class TornadoVMBackend implements ExecutionBackend {
                 for (int p = 0; p < k; p++) sum += a[i * k + p] * b[p * n + j];
                 c[i * n + j] = sum;
             }
+        }
+    }
+
+    public static void reduceSum(float[] input, @Reduce float[] result) {
+        for (@Parallel int i = 0; i < input.length; i++) {
+            result[0] += input[i];
+        }
+    }
+
+    public static void reduceSumD(double[] input, @Reduce double[] result) {
+        for (@Parallel int i = 0; i < input.length; i++) {
+            result[0] += input[i];
         }
     }
 }

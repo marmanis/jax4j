@@ -112,4 +112,24 @@ public class HostBackend implements ExecutionBackend {
         }
         return out;
     }
+
+    @Override
+    public float[] reduce(Primitive primitive, float[] a, Device device) {
+        float sum = 0;
+        for (float v : a) sum += v;
+        if (primitive == Primitive.MEAN) {
+            sum /= a.length;
+        }
+        return new float[]{sum};
+    }
+
+    @Override
+    public double[] reduce(Primitive primitive, double[] a, Device device) {
+        double sum = 0;
+        for (double v : a) sum += v;
+        if (primitive == Primitive.MEAN) {
+            sum /= a.length;
+        }
+        return new double[]{sum};
+    }
 }

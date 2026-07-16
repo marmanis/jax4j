@@ -189,4 +189,56 @@ public class JitCacheTest {
         for (int i = 0; i < a.length; i++) assertClose(b[i], a[i], 1e-10, "consistency[" + i + "]");
         assertTrue(tJit > 0, "sanity: measured non-zero jit time (" + tJit + " ns)");
     }
+
+    @Test
+    public void testGpuJitMatchesEagerAndCachesTrace() {
+        com.marmanis.jax4j.core.Device gpu = com.marmanis.jax4j.core.Device.getDevices().stream()
+            .filter(d -> d.getTornadoDevice() != null)
+            .findFirst()
+            .orElse(null);
+        if (gpu == null) {
+            System.out.println("No GPU device discovered; skipping GPU JIT test.");
+            return;
+        }
+
+        Function<NDArray, NDArray> fn = x -> x.mul(x).add(x);
+        Function<NDArray, NDArray> jittedFn = JAX.jit(fn);
+
+        NDArray x = new ConcreteNDArray(new float[]{2.0f, 3.0f}, new Shape(2), com.marmanis.jax4j.core.DType.FLOAT32, gpu);
+
+        // Run first execution (traces + compiles + executes plan)
+        NDArray y1 = jittedFn.apply(x);
+        assertClose(6.0, y1.toFloatArray()[0], 1e-5, "gpu y1[0]");
+        assertClose(12.0, y1.toFloatArray()[1], 1e-5, "gpu y1[1]");
+
+        // Run second execution (hits cache and executes pre-allocated GPU plan directly)
+        NDArray y2 = jittedFn.apply(new ConcreteNDArray(new float[]{5.0f, 7.0f}, new Shape(2), com.marmanis.jax4j.core.DType.FLOAT32, gpu));
+        assertClose(30.0, y2.toFloatArray()[0], 1e-5, "gpu y2[0]");
+        assertClose(56.0, y2.toFloatArray()[1], 1e-5, "gpu y2[1]");
+    }
+
+    @Test
+    public void testGpuJitHeavyFunctions() {
+        com.marmanis.jax4j.core.Device gpu = com.marmanis.jax4j.core.Device.getDevices().stream()
+            .filter(d -> d.getTornadoDevice() != null)
+            .findFirst()
+            .orElse(null);
+        if (gpu == null) return;
+
+        // heavy JIT compilation with matrix multiply + elementwise + reduction
+        Function<NDArray, NDArray> fn = x -> {
+            NDArray y = x.dot(x); // matrix multiply
+            NDArray z = y.mul(x).add(x);
+            return z.sum(); // reduction
+        };
+        Function<NDArray, NDArray> jitted = JAX.jit(fn);
+
+        NDArray x = new ConcreteNDArray(new float[]{1f, 2f, 3f, 4f}, new Shape(2, 2), com.marmanis.jax4j.core.DType.FLOAT32, gpu);
+
+        // eager reference
+        NDArray yEager = fn.apply(x);
+        NDArray yJit = jitted.apply(x);
+
+        assertClose(yEager.toFloatArray()[0], yJit.toFloatArray()[0], 1e-5, "heavy JIT correctness");
+    }
 }

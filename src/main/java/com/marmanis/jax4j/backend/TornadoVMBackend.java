@@ -388,4 +388,10 @@ public class TornadoVMBackend implements ExecutionBackend {
             result[0] += input[i];
         }
     }
+
+    public static void vectorCopy(float[] a, float[] c) {
+        for (@Parallel int i = 0; i < a.length; i++) {
+            c[i] = a[i];
+        }
+    }
 }

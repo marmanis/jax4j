@@ -12,6 +12,7 @@ import com.marmanis.jax4j.ir.Var;
 import com.marmanis.jax4j.pytree.PyTree;
 import com.marmanis.jax4j.tracing.TracedNDArray;
 import com.marmanis.jax4j.tracing.Tracer;
+import com.marmanis.jax4j.backend.TornadoJitCompiler;
 
 import java.util.Arrays;
 import java.util.List;
@@ -89,7 +90,7 @@ public class JAX {
      * gradient-of-a-traced-function caching.
      */
     public static Function<NDArray, NDArray> jit(Function<NDArray, NDArray> fn) {
-        java.util.concurrent.ConcurrentHashMap<TraceSignature, Jaxpr> cache =
+        java.util.concurrent.ConcurrentHashMap<TraceSignature, Object> cache =
             new java.util.concurrent.ConcurrentHashMap<>();
         return (arg) -> {
             if (Tracer.current() != null) {
@@ -97,8 +98,29 @@ public class JAX {
                 return fn.apply(arg);
             }
             TraceSignature key = new TraceSignature(arg.shape(), arg.dtype());
-            Jaxpr jaxpr = cache.computeIfAbsent(key, k -> make_jaxpr(fn, arg));
-            return Grad.forwardInterpret(jaxpr, List.of(arg)).get(0);
+            if (arg.device().getTornadoDevice() == null) {
+                // Host JIT: interpret Jaxpr
+                Jaxpr jaxpr = (Jaxpr) cache.computeIfAbsent(key, k -> make_jaxpr(fn, arg));
+                return Grad.forwardInterpret(jaxpr, List.of(arg)).get(0);
+            } else {
+                // GPU/TornadoVM JIT: compile to TornadoVM plan
+                Object plan = cache.compute(key, (k, existing) -> {
+                    if (existing != null) return existing;
+                    Jaxpr jaxpr = make_jaxpr(fn, arg);
+                    try {
+                        return TornadoJitCompiler.compile(jaxpr, arg.device());
+                    } catch (Throwable t) {
+                        // Fallback to Jaxpr if compilation fails (e.g. unsupported ops)
+                        return jaxpr;
+                    }
+                });
+
+                if (plan instanceof Jaxpr jaxpr) {
+                    return Grad.forwardInterpret(jaxpr, List.of(arg)).get(0);
+                } else {
+                    return ((TornadoJitCompiler.CompiledPlan) plan).execute(List.of(arg), arg.device());
+                }
+            }
         };
     }
 

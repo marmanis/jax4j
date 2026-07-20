@@ -1096,13 +1096,13 @@ public final class Fft {
         float[] hre = re.toFloatArray();
         float[] him = im.toFloatArray();
         int total = n0 * n1 * n2;
-        FloatArray bufA = new FloatArray(2 * total);
-        FloatArray bufB = new FloatArray(2 * total);
+        Plan3F32 pp = acquireF32(n0, n1, n2, inverse, dev);
+        FloatArray bufA = pp.bufA();
         for (int i = 0; i < total; i++) {
             bufA.set(2 * i, hre[i]);
             bufA.set(2 * i + 1, him[i]);
         }
-        runFft3F32Plan(bufA, bufB, dev, n0, n1, n2, inverse);
+        execPlan(pp.plan(), "cuFFT F32 3-D dispatch failed");
 
         float[] outRe = new float[total];
         float[] outIm = new float[total];
@@ -1123,13 +1123,13 @@ public final class Fft {
         double[] hre = re.toDoubleArray();
         double[] him = im.toDoubleArray();
         int total = n0 * n1 * n2;
-        DoubleArray bufA = new DoubleArray(2 * total);
-        DoubleArray bufB = new DoubleArray(2 * total);
+        Plan3F64 pp = acquireF64(n0, n1, n2, inverse, dev);
+        DoubleArray bufA = pp.bufA();
         for (int i = 0; i < total; i++) {
             bufA.set(2 * i, hre[i]);
             bufA.set(2 * i + 1, him[i]);
         }
-        runFft3F64Plan(bufA, bufB, dev, n0, n1, n2, inverse);
+        execPlan(pp.plan(), "cuFFT F64 3-D dispatch failed");
 
         double[] outRe = new double[total];
         double[] outIm = new double[total];
@@ -1143,6 +1143,14 @@ public final class Fft {
             new ConcreteNDArray(outRe, sh, dev),
             new ConcreteNDArray(outIm, sh, dev)
         };
+    }
+
+    private static void execPlan(TornadoExecutionPlan p, String failMsg) {
+        try {
+            p.execute();
+        } catch (Exception e) {
+            throw new RuntimeException(failMsg, e);
+        }
     }
 
     /**
@@ -1214,13 +1222,13 @@ public final class Fft {
     private static NDArray[] rfft3DispatchF32(NDArray x, Device dev, int n0, int n1, int n2) {
         float[] src = x.toFloatArray();
         int total = n0 * n1 * n2;
-        FloatArray bufA = new FloatArray(2 * total);
-        FloatArray bufB = new FloatArray(2 * total);
+        Plan3F32 pp = acquireF32(n0, n1, n2, /*inverse=*/false, dev);
+        FloatArray bufA = pp.bufA();
         for (int i = 0; i < total; i++) {
             bufA.set(2 * i, src[i]);
             bufA.set(2 * i + 1, 0f);
         }
-        runFft3F32Plan(bufA, bufB, dev, n0, n1, n2, /*inverse=*/false);
+        execPlan(pp.plan(), "cuFFT F32 3-D dispatch failed");
 
         int half = n2 / 2 + 1;
         float[] outRe = new float[n0 * n1 * half];
@@ -1245,13 +1253,13 @@ public final class Fft {
     private static NDArray[] rfft3DispatchF64(NDArray x, Device dev, int n0, int n1, int n2) {
         double[] src = x.toDoubleArray();
         int total = n0 * n1 * n2;
-        DoubleArray bufA = new DoubleArray(2 * total);
-        DoubleArray bufB = new DoubleArray(2 * total);
+        Plan3F64 pp = acquireF64(n0, n1, n2, /*inverse=*/false, dev);
+        DoubleArray bufA = pp.bufA();
         for (int i = 0; i < total; i++) {
             bufA.set(2 * i, src[i]);
             bufA.set(2 * i + 1, 0.0);
         }
-        runFft3F64Plan(bufA, bufB, dev, n0, n1, n2, false);
+        execPlan(pp.plan(), "cuFFT F64 3-D dispatch failed");
 
         int half = n2 / 2 + 1;
         double[] outRe = new double[n0 * n1 * half];
@@ -1283,8 +1291,8 @@ public final class Fft {
         float[] sRe = re.toFloatArray();
         float[] sIm = im.toFloatArray();
         int total = n0 * n1 * n2;
-        FloatArray bufA = new FloatArray(2 * total);
-        FloatArray bufB = new FloatArray(2 * total);
+        Plan3F32 pp = acquireF32(n0, n1, n2, /*inverse=*/true, dev);
+        FloatArray bufA = pp.bufA();
         for (int i = 0; i < n0; i++) {
             int iMir = (n0 - i) % n0;
             for (int j = 0; j < n1; j++) {
@@ -1306,7 +1314,7 @@ public final class Fft {
                 }
             }
         }
-        runFft3F32Plan(bufA, bufB, dev, n0, n1, n2, /*inverse=*/true);
+        execPlan(pp.plan(), "cuFFT F32 3-D dispatch failed");
 
         float[] out = new float[total];
         float scale = 1f / total;
@@ -1320,8 +1328,8 @@ public final class Fft {
         double[] sRe = re.toDoubleArray();
         double[] sIm = im.toDoubleArray();
         int total = n0 * n1 * n2;
-        DoubleArray bufA = new DoubleArray(2 * total);
-        DoubleArray bufB = new DoubleArray(2 * total);
+        Plan3F64 pp = acquireF64(n0, n1, n2, /*inverse=*/true, dev);
+        DoubleArray bufA = pp.bufA();
         for (int i = 0; i < n0; i++) {
             int iMir = (n0 - i) % n0;
             for (int j = 0; j < n1; j++) {
@@ -1343,7 +1351,7 @@ public final class Fft {
                 }
             }
         }
-        runFft3F64Plan(bufA, bufB, dev, n0, n1, n2, true);
+        execPlan(pp.plan(), "cuFFT F64 3-D dispatch failed");
 
         double[] out = new double[total];
         double scale = 1.0 / total;

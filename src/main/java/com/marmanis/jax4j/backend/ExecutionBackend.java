@@ -18,6 +18,16 @@ public interface ExecutionBackend {
     /** Computes the {@code (m x k) @ (k x n)} matrix product {@code a @ b}, row-major. */
     float[] matmul(float[] a, float[] b, int m, int k, int n, Device device);
 
+    /** Computes the reduction of array `a` to a scalar. */
+    float[] reduce(Primitive primitive, float[] a, Device device);
+
+    /**
+     * FLOAT64 reduction. Defaults to host.
+     */
+    default double[] reduce(Primitive primitive, double[] a, Device device) {
+        return HostBackend.INSTANCE.reduce(primitive, a, device);
+    }
+
     /**
      * FLOAT64 elementwise binary op. Backends that don't want to accelerate
      * FLOAT64 (e.g. because their hardware's FP64 throughput is far lower

@@ -12,7 +12,7 @@
         <maven.compiler.source>25</maven.compiler.source>
         <maven.compiler.target>25</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <tornadovm.version>4.0.1-jdk25</tornadovm.version>
+        <tornadovm.version>5.0.0-jdk25</tornadovm.version>
         <junit.version>5.10.2</junit.version>
         <slf4j.version>2.0.12</slf4j.version>
         <logback.version>1.5.3</logback.version>
@@ -32,6 +32,17 @@
             <artifactId>tornado-matrices</artifactId>
             <version>${tornadovm.version}</version>
         </dependency>
+
+        <!--
+            NOTE: cuFFT integration in jax4j does NOT require the
+            tornado-cufft jar as a Maven dependency. The Fft class
+            constructs LibraryTaskDescriptor("nvidia/cufft", ...) directly
+            using types from tornado-api. At runtime the descriptor is
+            resolved against libtornado-cufft.so + libcufft.so if the
+            TornadoVM SDK is -cuda or -full and the CUDA Toolkit is
+            installed; otherwise Fft.fft/ifft fall back to the host loop.
+            Users therefore don't need install-file to build jax4j.
+        -->
 
         <!-- Logging -->
         <dependency>
@@ -73,8 +84,6 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
-                <configuration>
-                </configuration>
             </plugin>
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
@@ -83,4 +92,61 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+            "tornado" profile: activated automatically when TORNADOVM_HOME
+            points at a TornadoVM SDK.
+
+            TornadoVM 5.0+ ships a pre-tailored "tornado-argfile" containing
+            every JVM flag needed for THIS installation (module path,
+            required exports/opens for graal/JVMCI, native library path,
+            enable-preview, native-access declarations for the drivers this
+            SDK was built with, etc). We consume it via Java's @filename
+            syntax, so this profile stays a one-liner regardless of which
+            TornadoVM backend (ptx, opencl, spirv, full, ...) is installed
+            — TornadoVM regenerates the argfile per SDK.
+
+            Run benchmarks and examples via:
+                mvn -Ptornado exec:exec -Dexec.mainClass=com.marmanis.jax4j.examples.BackendBenchmark
+            (exec:exec forks a fresh JVM with the argfile so TornadoVM's
+            module system is set up at JVM start.)
+        -->
+        <profile>
+            <id>tornado</id>
+            <activation>
+                <property><name>env.TORNADOVM_HOME</name></property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <argLine>@${env.TORNADOVM_HOME}/tornado-argfile</argLine>
+                        </configuration>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>default-cli</id>
+                                <goals><goal>exec</goal></goals>
+                                <configuration>
+                                    <executable>${env.JAVA_HOME}/bin/java</executable>
+                                    <arguments>
+                                        <argument>@${env.TORNADOVM_HOME}/tornado-argfile</argument>
+                                        <argument>-classpath</argument>
+                                        <classpath/>
+                                        <argument>${exec.mainClass}</argument>
+                                    </arguments>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>

@@ -12,6 +12,7 @@ import com.marmanis.jax4j.ir.Var;
 import com.marmanis.jax4j.pytree.PyTree;
 import com.marmanis.jax4j.tracing.TracedNDArray;
 import com.marmanis.jax4j.tracing.Tracer;
+import com.marmanis.jax4j.backend.TornadoJitCompiler;
 
 import java.util.Arrays;
 import java.util.List;
@@ -54,6 +55,17 @@ public class JAX {
     }
 
     /**
+     * Computes the Jacobian-Vector Product (JVP) / forward-mode autodiff.
+     * Propagates primals and tangents forward through the function.
+     * Returns a 2-element array: [primal_out, tangent_out].
+     */
+    public static NDArray[] jvp(Function<NDArray, NDArray> fn, NDArray arg, NDArray tangent) {
+        Jaxpr jaxpr = make_jaxpr(fn, arg);
+        Grad.ForwardAdResult result = Grad.forwardAd(jaxpr, List.of(arg), List.of(tangent));
+        return new NDArray[]{result.primals().get(0), result.tangents().get(0)};
+    }
+
+    /**
      * Wraps {@code fn} so it is traced once per distinct input signature
      * (shape + dtype) and re-executed via {@link Grad#forwardInterpret}
      * on subsequent calls. Repeated invocations with the same signature
@@ -78,7 +90,7 @@ public class JAX {
      * gradient-of-a-traced-function caching.
      */
     public static Function<NDArray, NDArray> jit(Function<NDArray, NDArray> fn) {
-        java.util.concurrent.ConcurrentHashMap<TraceSignature, Jaxpr> cache =
+        java.util.concurrent.ConcurrentHashMap<TraceSignature, Object> cache =
             new java.util.concurrent.ConcurrentHashMap<>();
         return (arg) -> {
             if (Tracer.current() != null) {
@@ -86,8 +98,29 @@ public class JAX {
                 return fn.apply(arg);
             }
             TraceSignature key = new TraceSignature(arg.shape(), arg.dtype());
-            Jaxpr jaxpr = cache.computeIfAbsent(key, k -> make_jaxpr(fn, arg));
-            return Grad.forwardInterpret(jaxpr, List.of(arg)).get(0);
+            if (arg.device().getTornadoDevice() == null) {
+                // Host JIT: interpret Jaxpr
+                Jaxpr jaxpr = (Jaxpr) cache.computeIfAbsent(key, k -> make_jaxpr(fn, arg));
+                return Grad.forwardInterpret(jaxpr, List.of(arg)).get(0);
+            } else {
+                // GPU/TornadoVM JIT: compile to TornadoVM plan
+                Object plan = cache.compute(key, (k, existing) -> {
+                    if (existing != null) return existing;
+                    Jaxpr jaxpr = make_jaxpr(fn, arg);
+                    try {
+                        return TornadoJitCompiler.compile(jaxpr, arg.device());
+                    } catch (Throwable t) {
+                        // Fallback to Jaxpr if compilation fails (e.g. unsupported ops)
+                        return jaxpr;
+                    }
+                });
+
+                if (plan instanceof Jaxpr jaxpr) {
+                    return Grad.forwardInterpret(jaxpr, List.of(arg)).get(0);
+                } else {
+                    return ((TornadoJitCompiler.CompiledPlan) plan).execute(List.of(arg), arg.device());
+                }
+            }
         };
     }
 

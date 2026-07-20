@@ -18,7 +18,8 @@ public class DeviceBackendSelectionTest {
         Device.useBackend("ptx");
         Device d = Device.defaultDevice();
         if (d.getTornadoDevice() != null) {
-            assertEquals(TornadoDeviceType.GPU, d.getTornadoDevice().getDeviceType());
+            uk.ac.manchester.tornado.api.common.TornadoDevice expectedDevice = uk.ac.manchester.tornado.api.TornadoExecutionPlan.getDevice(1, 0);
+            assertEquals(expectedDevice.getDeviceName(), d.getTornadoDevice().getDeviceName());
         }
     }
 
@@ -27,7 +28,8 @@ public class DeviceBackendSelectionTest {
         Device.useBackend("opencl");
         Device d = Device.defaultDevice();
         if (d.getTornadoDevice() != null) {
-            assertEquals(TornadoDeviceType.CPU, d.getTornadoDevice().getDeviceType());
+            uk.ac.manchester.tornado.api.common.TornadoDevice expectedDevice = uk.ac.manchester.tornado.api.TornadoExecutionPlan.getDevice(0, 0);
+            assertEquals(expectedDevice.getDeviceName(), d.getTornadoDevice().getDeviceName());
         }
     }
 

@@ -1,0 +1,730 @@
+<title>TornadoVM 5.0 Backend Benchmark — FP32 Matmul</title>
+<style>
+    :root {
+        --bg: #FAFAF5;
+        --surface: #FFFFFF;
+        --text: #17171B;
+        --text-muted: #6B6B70;
+        --text-subtle: #A0A0A5;
+        --rule: rgba(0, 0, 0, 0.09);
+        --grid: rgba(0, 0, 0, 0.05);
+        --row-alt: rgba(0, 0, 0, 0.025);
+
+        /* Series accents, one per backend, chosen from each ecosystem's world. */
+        --c-cpu1: #A1A1A5;       /* muted stone — the baseline reference */
+        --c-cpujava: #F97316;    /* burnt orange — Java's coffee */
+        --c-cpuocl: #0EA5E9;     /* sky — OpenCL/POCL */
+        --c-gpu: #76B900;        /* NVIDIA green — iconic for PTX */
+
+        --font-sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI",
+            Roboto, "Helvetica Neue", Arial, sans-serif;
+        --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo,
+            Consolas, "Cascadia Mono", monospace;
+    }
+
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --bg: #0F1216;
+            --surface: #14181D;
+            --text: #E9E9EC;
+            --text-muted: #8B8B90;
+            --text-subtle: #565660;
+            --rule: rgba(255, 255, 255, 0.10);
+            --grid: rgba(255, 255, 255, 0.07);
+            --row-alt: rgba(255, 255, 255, 0.025);
+        }
+    }
+    :root[data-theme="dark"] {
+        --bg: #0F1216;
+        --surface: #14181D;
+        --text: #E9E9EC;
+        --text-muted: #8B8B90;
+        --text-subtle: #565660;
+        --rule: rgba(255, 255, 255, 0.10);
+        --grid: rgba(255, 255, 255, 0.07);
+        --row-alt: rgba(255, 255, 255, 0.025);
+    }
+    :root[data-theme="light"] {
+        --bg: #FAFAF5;
+        --surface: #FFFFFF;
+        --text: #17171B;
+        --text-muted: #6B6B70;
+        --text-subtle: #A0A0A5;
+        --rule: rgba(0, 0, 0, 0.09);
+        --grid: rgba(0, 0, 0, 0.05);
+        --row-alt: rgba(0, 0, 0, 0.025);
+    }
+
+    html, body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: var(--font-sans);
+        font-size: 15px;
+        line-height: 1.55;
+        -webkit-font-smoothing: antialiased;
+    }
+
+    main {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 64px 32px 96px;
+    }
+
+    /* --- header --- */
+    .eyebrow {
+        display: inline-block;
+        font-size: 11.5px;
+        font-weight: 600;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--c-gpu);
+        margin-bottom: 22px;
+    }
+    h1 {
+        font-size: 44px;
+        font-weight: 700;
+        letter-spacing: -0.025em;
+        line-height: 1.05;
+        margin: 0 0 20px;
+        text-wrap: balance;
+    }
+    .subtitle {
+        font-size: 17px;
+        color: var(--text-muted);
+        max-width: 62ch;
+        margin: 0 0 40px;
+    }
+
+    /* Kicker: the headline result. */
+    .kicker {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 24px;
+        align-items: baseline;
+        padding: 28px 32px;
+        margin: 0 0 56px;
+        background: var(--surface);
+        border: 1px solid var(--rule);
+        border-radius: 6px;
+        border-left: 3px solid var(--c-gpu);
+    }
+    .kicker .value {
+        font-family: var(--font-mono);
+        font-size: 44px;
+        font-weight: 500;
+        letter-spacing: -0.02em;
+        color: var(--c-gpu);
+        line-height: 1;
+        font-variant-numeric: tabular-nums;
+    }
+    .kicker .value .unit {
+        font-size: 20px;
+        color: var(--text-muted);
+        margin-left: 4px;
+    }
+    .kicker .caption {
+        font-size: 14.5px;
+        color: var(--text-muted);
+        line-height: 1.5;
+    }
+    .kicker .caption strong {
+        color: var(--text);
+        font-weight: 600;
+    }
+
+    /* --- section frame --- */
+    section {
+        margin-bottom: 72px;
+    }
+    h2 {
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--text-muted);
+        margin: 0 0 24px;
+        padding-bottom: 12px;
+        border-bottom: 1px solid var(--rule);
+    }
+
+    /* --- chart --- */
+    .chart-wrap {
+        overflow-x: auto;
+    }
+    svg.chart {
+        display: block;
+        width: 100%;
+        height: auto;
+        min-width: 640px;
+    }
+    .chart-label {
+        font-family: var(--font-sans);
+        font-size: 11.5px;
+        fill: var(--text-muted);
+    }
+    .chart-label-mono {
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        fill: var(--text-muted);
+        font-variant-numeric: tabular-nums;
+    }
+    .chart-axis {
+        stroke: var(--text-subtle);
+        stroke-width: 1;
+    }
+    .chart-grid {
+        stroke: var(--grid);
+        stroke-width: 1;
+    }
+    .series-line {
+        fill: none;
+        stroke-width: 2;
+    }
+    .series-line-dashed {
+        fill: none;
+        stroke-width: 2;
+        stroke-dasharray: 4 4;
+        opacity: 0.85;
+    }
+    .series-dot {
+        stroke: var(--bg);
+        stroke-width: 2;
+    }
+    .series-endcap {
+        font-family: var(--font-sans);
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: -0.005em;
+    }
+
+    /* Legend below chart. */
+    .legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 20px 32px;
+        margin-top: 28px;
+        padding-top: 22px;
+        border-top: 1px solid var(--rule);
+    }
+    .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 13px;
+    }
+    .legend-swatch {
+        width: 22px;
+        height: 3px;
+        border-radius: 0;
+    }
+    .legend-label {
+        color: var(--text);
+        font-weight: 500;
+    }
+    .legend-note {
+        color: var(--text-muted);
+        margin-left: 6px;
+    }
+
+    /* --- data table --- */
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        font-family: var(--font-mono);
+        font-size: 13.5px;
+        font-variant-numeric: tabular-nums;
+    }
+    thead th {
+        font-family: var(--font-sans);
+        font-size: 11.5px;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--text-muted);
+        padding: 12px 14px;
+        text-align: right;
+        border-bottom: 1px solid var(--rule);
+    }
+    thead th:first-child {
+        text-align: left;
+    }
+    tbody td {
+        padding: 12px 14px;
+        text-align: right;
+        color: var(--text);
+    }
+    tbody td:first-child {
+        text-align: left;
+        font-family: var(--font-sans);
+        font-weight: 500;
+    }
+    tbody tr:nth-child(even) {
+        background: var(--row-alt);
+    }
+    tbody td.speedup {
+        color: var(--c-gpu);
+        font-weight: 500;
+    }
+    tbody td.slow {
+        color: var(--text-subtle);
+    }
+    tbody td.skip {
+        color: var(--text-subtle);
+    }
+    tbody td.peak {
+        color: var(--text);
+        font-weight: 600;
+    }
+    .col-swatch {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-right: 8px;
+        vertical-align: 1px;
+    }
+
+    .footnote {
+        margin-top: 14px;
+        font-size: 12.5px;
+        color: var(--text-muted);
+        line-height: 1.55;
+    }
+    .footnote sup {
+        color: var(--text-subtle);
+        margin-right: 4px;
+    }
+
+    /* --- observations --- */
+    .obs {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 20px;
+    }
+    .obs-card {
+        padding: 22px 24px;
+        background: var(--surface);
+        border: 1px solid var(--rule);
+        border-radius: 6px;
+    }
+    .obs-card h3 {
+        margin: 0 0 8px;
+        font-size: 14.5px;
+        font-weight: 600;
+        letter-spacing: -0.005em;
+    }
+    .obs-card p {
+        margin: 0;
+        font-size: 13.5px;
+        color: var(--text-muted);
+        line-height: 1.55;
+    }
+    .obs-card .figure {
+        font-family: var(--font-mono);
+        color: var(--text);
+        font-weight: 500;
+    }
+
+    /* --- setup footer --- */
+    .setup {
+        margin-top: 8px;
+        padding: 24px 28px;
+        background: transparent;
+        border: 1px solid var(--rule);
+        border-radius: 6px;
+        font-family: var(--font-mono);
+        font-size: 12.5px;
+        line-height: 1.7;
+        color: var(--text-muted);
+        font-variant-numeric: tabular-nums;
+    }
+    .setup dl {
+        margin: 0;
+        display: grid;
+        grid-template-columns: 168px 1fr;
+        gap: 4px 20px;
+    }
+    .setup dt {
+        color: var(--text-subtle);
+        text-transform: uppercase;
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        padding-top: 3px;
+    }
+    .setup dd {
+        margin: 0;
+        color: var(--text);
+    }
+
+    @media (max-width: 720px) {
+        main { padding: 40px 20px 64px; }
+        h1 { font-size: 32px; }
+        .kicker { padding: 22px 24px; grid-template-columns: 1fr; gap: 12px; }
+        .kicker .value { font-size: 36px; }
+        .setup dl { grid-template-columns: 1fr; gap: 2px 0; }
+        .setup dt { padding-top: 12px; }
+    }
+</style>
+
+<main>
+    <div class="eyebrow">Iteration 6 · Benchmark</div>
+    <h1>Where the GPU actually wins.</h1>
+    <p class="subtitle">
+        FP32 matrix multiplication in jax4j across four execution backends, on
+        the same machine, at six sizes from 256² to 8192². Median of five
+        timed runs after two warm-ups. The interesting shape is the
+        crossover — small sizes are dispatch-dominated, large sizes are
+        compute-dominated, and the ratio keeps growing.
+    </p>
+
+    <div class="kicker">
+        <div class="value">56<span class="unit">×</span></div>
+        <div class="caption">
+            At <strong>8192 × 8192</strong>, the RTX 4060 finishes in
+            <strong>4.65 s</strong> — <strong>56× faster</strong> than the
+            same code as Java parallel streams on all 16 CPU cores, which
+            takes <strong>4 minutes 22 seconds</strong> to do the same
+            work.
+        </div>
+    </div>
+
+    <section>
+        <h2>Matmul time vs matrix side, log-log</h2>
+        <div class="chart-wrap">
+            <svg class="chart" viewBox="0 0 900 500" role="img"
+                 aria-label="Log-log chart: matmul time in milliseconds versus matrix side length, across four backends, sizes 256 through 8192.">
+
+                <!-- Plot area: x in [90, 810], y in [40, 440] -->
+                <!-- X: log2(size) with 6 discrete points at 256, 512, 1024, 2048, 4096, 8192 -->
+                <!-- Y: log10(ms) from 1 to 1_000_000 (6 decades, 66.67 px each) -->
+
+                <!-- Horizontal grid at each decade -->
+                <line class="chart-grid" x1="90" y1="440"    x2="810" y2="440"/>
+                <line class="chart-grid" x1="90" y1="373.33" x2="810" y2="373.33"/>
+                <line class="chart-grid" x1="90" y1="306.67" x2="810" y2="306.67"/>
+                <line class="chart-grid" x1="90" y1="240"    x2="810" y2="240"/>
+                <line class="chart-grid" x1="90" y1="173.33" x2="810" y2="173.33"/>
+                <line class="chart-grid" x1="90" y1="106.67" x2="810" y2="106.67"/>
+                <line class="chart-grid" x1="90" y1="40"     x2="810" y2="40"/>
+
+                <!-- Vertical grid at each size point -->
+                <line class="chart-grid" x1="90"  y1="40" x2="90"  y2="440"/>
+                <line class="chart-grid" x1="234" y1="40" x2="234" y2="440"/>
+                <line class="chart-grid" x1="378" y1="40" x2="378" y2="440"/>
+                <line class="chart-grid" x1="522" y1="40" x2="522" y2="440"/>
+                <line class="chart-grid" x1="666" y1="40" x2="666" y2="440"/>
+                <line class="chart-grid" x1="810" y1="40" x2="810" y2="440"/>
+
+                <!-- Y-axis labels -->
+                <text class="chart-label-mono" x="80" y="443"    text-anchor="end">1 ms</text>
+                <text class="chart-label-mono" x="80" y="376.33" text-anchor="end">10 ms</text>
+                <text class="chart-label-mono" x="80" y="309.67" text-anchor="end">100 ms</text>
+                <text class="chart-label-mono" x="80" y="243"    text-anchor="end">1 s</text>
+                <text class="chart-label-mono" x="80" y="176.33" text-anchor="end">10 s</text>
+                <text class="chart-label-mono" x="80" y="109.67" text-anchor="end">100 s</text>
+                <text class="chart-label-mono" x="80" y="43"     text-anchor="end">1000 s</text>
+
+                <!-- X-axis labels -->
+                <text class="chart-label-mono" x="90"  y="464" text-anchor="middle">256²</text>
+                <text class="chart-label-mono" x="234" y="464" text-anchor="middle">512²</text>
+                <text class="chart-label-mono" x="378" y="464" text-anchor="middle">1024²</text>
+                <text class="chart-label-mono" x="522" y="464" text-anchor="middle">2048²</text>
+                <text class="chart-label-mono" x="666" y="464" text-anchor="middle">4096²</text>
+                <text class="chart-label-mono" x="810" y="464" text-anchor="middle">8192²</text>
+
+                <text class="chart-label" x="450" y="490" text-anchor="middle">Matrix side (n)</text>
+
+                <!--
+                  Series lines. Precomputed:
+                    y = 440 - log10(v_ms) * 66.67
+                    x by size: 256→90  512→234  1024→378  2048→522  4096→666  8192→810
+                -->
+
+                <!--
+                    CPU-1 (single-thread) — 10.70, 191.37, 3887.62, 40898.14
+                    Not run beyond 2048² (would take ~5 min at 4096², ~40 min at 8192² per run).
+                    Line ends at 2048; dashed segment shows the extrapolation slope.
+                -->
+                <polyline class="series-line" stroke="var(--c-cpu1)"
+                          points="90,371.4 234,287.9 378,200.68 522,132.56"/>
+                <polyline class="series-line-dashed" stroke="var(--c-cpu1)"
+                          points="522,132.56 810,-59.90"/>
+                <circle class="series-dot" fill="var(--c-cpu1)" cx="90"  cy="371.4"  r="4"/>
+                <circle class="series-dot" fill="var(--c-cpu1)" cx="234" cy="287.9"  r="4"/>
+                <circle class="series-dot" fill="var(--c-cpu1)" cx="378" cy="200.68" r="4"/>
+                <circle class="series-dot" fill="var(--c-cpu1)" cx="522" cy="132.56" r="4"/>
+
+                <!-- CPU-N Java streams — 1.17, 11.86, 196.46, 2353.95, 26863.16, 261828.74 -->
+                <polyline class="series-line" stroke="var(--c-cpujava)"
+                          points="90,435.45 234,368.39 378,287.13 522,215.21 666,144.71 810,78.80"/>
+                <circle class="series-dot" fill="var(--c-cpujava)" cx="90"  cy="435.45" r="4"/>
+                <circle class="series-dot" fill="var(--c-cpujava)" cx="234" cy="368.39" r="4"/>
+                <circle class="series-dot" fill="var(--c-cpujava)" cx="378" cy="287.13" r="4"/>
+                <circle class="series-dot" fill="var(--c-cpujava)" cx="522" cy="215.21" r="4"/>
+                <circle class="series-dot" fill="var(--c-cpujava)" cx="666" cy="144.71" r="4"/>
+                <circle class="series-dot" fill="var(--c-cpujava)" cx="810" cy="78.80"  r="4"/>
+
+                <!--
+                    CPU-N OpenCL (POCL) — 33.69, 46.73, 296.30, 2538.05, 27415.23; SIGSEGV at 8192².
+                    Line ends at 4096²; solid segment only for measured data.
+                -->
+                <polyline class="series-line" stroke="var(--c-cpuocl)"
+                          points="90,338.17 234,328.68 378,275.23 522,213.03 666,144.12"/>
+                <circle class="series-dot" fill="var(--c-cpuocl)" cx="90"  cy="338.17" r="4"/>
+                <circle class="series-dot" fill="var(--c-cpuocl)" cx="234" cy="328.68" r="4"/>
+                <circle class="series-dot" fill="var(--c-cpuocl)" cx="378" cy="275.23" r="4"/>
+                <circle class="series-dot" fill="var(--c-cpuocl)" cx="522" cy="213.03" r="4"/>
+                <circle class="series-dot" fill="var(--c-cpuocl)" cx="666" cy="144.12" r="4"/>
+
+                <!-- GPU PTX (RTX 4060) — 14.45, 16.76, 51.30, 60.54, 655.25, 4649.70 -->
+                <polyline class="series-line" stroke="var(--c-gpu)"
+                          points="90,362.67 234,358.37 378,325.99 522,321.20 666,252.24 810,195.49"/>
+                <circle class="series-dot" fill="var(--c-gpu)" cx="90"  cy="362.67" r="4.5"/>
+                <circle class="series-dot" fill="var(--c-gpu)" cx="234" cy="358.37" r="4.5"/>
+                <circle class="series-dot" fill="var(--c-gpu)" cx="378" cy="325.99" r="4.5"/>
+                <circle class="series-dot" fill="var(--c-gpu)" cx="522" cy="321.20" r="4.5"/>
+                <circle class="series-dot" fill="var(--c-gpu)" cx="666" cy="252.24" r="4.5"/>
+                <circle class="series-dot" fill="var(--c-gpu)" cx="810" cy="195.49" r="4.5"/>
+
+                <!-- Axes -->
+                <line class="chart-axis" x1="90" y1="40"  x2="90"  y2="440"/>
+                <line class="chart-axis" x1="90" y1="440" x2="810" y2="440"/>
+            </svg>
+        </div>
+
+        <div class="legend">
+            <div class="legend-item">
+                <span class="legend-swatch" style="background: var(--c-cpu1);"></span>
+                <span class="legend-label">CPU-1</span>
+                <span class="legend-note">single-thread; not run past 2048² (dashed = extrapolated slope)</span>
+            </div>
+            <div class="legend-item">
+                <span class="legend-swatch" style="background: var(--c-cpujava);"></span>
+                <span class="legend-label">CPU-N (Java parallel streams)</span>
+                <span class="legend-note">Fork/Join across all 16 cores</span>
+            </div>
+            <div class="legend-item">
+                <span class="legend-swatch" style="background: var(--c-cpuocl);"></span>
+                <span class="legend-label">CPU-N (POCL / OpenCL)</span>
+                <span class="legend-note">TornadoVM OpenCL to CPU; SIGSEGV at 8192²</span>
+            </div>
+            <div class="legend-item">
+                <span class="legend-swatch" style="background: var(--c-gpu);"></span>
+                <span class="legend-label">NVIDIA GPU (PTX)</span>
+                <span class="legend-note">RTX 4060 Laptop via TornadoVM PTX</span>
+            </div>
+        </div>
+    </section>
+
+    <section>
+        <h2>Median times, milliseconds</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>size</th>
+                    <th><span class="col-swatch" style="background: var(--c-cpu1);"></span>CPU-1</th>
+                    <th><span class="col-swatch" style="background: var(--c-cpujava);"></span>CPU-N Java</th>
+                    <th><span class="col-swatch" style="background: var(--c-cpuocl);"></span>CPU-N POCL</th>
+                    <th><span class="col-swatch" style="background: var(--c-gpu);"></span>GPU (PTX)</th>
+                    <th>GPU vs CPU-N</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>256 × 256</td>
+                    <td>10.70</td>
+                    <td>1.17</td>
+                    <td>33.69</td>
+                    <td>14.45</td>
+                    <td class="slow">0.08×</td>
+                </tr>
+                <tr>
+                    <td>512 × 512</td>
+                    <td>191.37</td>
+                    <td>11.86</td>
+                    <td>46.73</td>
+                    <td>16.76</td>
+                    <td class="slow">0.71×</td>
+                </tr>
+                <tr>
+                    <td>1024 × 1024</td>
+                    <td>3 887.62</td>
+                    <td>196.46</td>
+                    <td>296.30</td>
+                    <td>51.30</td>
+                    <td class="speedup">3.83×</td>
+                </tr>
+                <tr>
+                    <td>2048 × 2048</td>
+                    <td>40 898.14</td>
+                    <td>2 353.95</td>
+                    <td>2 538.05</td>
+                    <td>60.54</td>
+                    <td class="speedup">38.88×</td>
+                </tr>
+                <tr>
+                    <td>4096 × 4096</td>
+                    <td class="skip">— <sup>a</sup></td>
+                    <td>26 863.16</td>
+                    <td>27 415.23</td>
+                    <td>655.25</td>
+                    <td class="speedup">40.99×</td>
+                </tr>
+                <tr>
+                    <td>8192 × 8192</td>
+                    <td class="skip">— <sup>a</sup></td>
+                    <td>261 828.74</td>
+                    <td class="skip">— <sup>b</sup></td>
+                    <td>4 649.70</td>
+                    <td class="speedup">56.31×</td>
+                </tr>
+            </tbody>
+        </table>
+        <p class="footnote">
+            <sup>a</sup> CPU-1 skipped at n ≥ 4096: a naive single-thread matmul at
+            n = 8192 would take ~40 minutes per run, ~5 hours to gather five
+            samples plus warm-ups. The story is CPU-N vs GPU at these sizes.
+            <br>
+            <sup>b</sup> POCL crashed with SIGSEGV during 8192² warm-up (likely an
+            OpenCL buffer-size limit inside the POCL runtime — each of the
+            three FP32 arrays is 256 MB). Java streams on the same 16 cores
+            completed the same problem in 4:22.
+        </p>
+    </section>
+
+    <section>
+        <h2>Sustained throughput, GFLOPS</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>size</th>
+                    <th><span class="col-swatch" style="background: var(--c-cpu1);"></span>CPU-1</th>
+                    <th><span class="col-swatch" style="background: var(--c-cpujava);"></span>CPU-N Java</th>
+                    <th><span class="col-swatch" style="background: var(--c-cpuocl);"></span>CPU-N POCL</th>
+                    <th><span class="col-swatch" style="background: var(--c-gpu);"></span>GPU (PTX)</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>256 × 256</td>
+                    <td class="peak">3.14</td>
+                    <td class="peak">28.68</td>
+                    <td>1.00</td>
+                    <td>2.32</td>
+                </tr>
+                <tr>
+                    <td>512 × 512</td>
+                    <td>1.40</td>
+                    <td>22.63</td>
+                    <td>5.75</td>
+                    <td>16.02</td>
+                </tr>
+                <tr>
+                    <td>1024 × 1024</td>
+                    <td>0.55</td>
+                    <td>10.93</td>
+                    <td class="peak">7.25</td>
+                    <td>41.86</td>
+                </tr>
+                <tr>
+                    <td>2048 × 2048</td>
+                    <td>0.42</td>
+                    <td>7.30</td>
+                    <td>6.77</td>
+                    <td class="peak">283.79</td>
+                </tr>
+                <tr>
+                    <td>4096 × 4096</td>
+                    <td class="skip">— <sup>a</sup></td>
+                    <td>5.12</td>
+                    <td>5.01</td>
+                    <td>209.75</td>
+                </tr>
+                <tr>
+                    <td>8192 × 8192</td>
+                    <td class="skip">— <sup>a</sup></td>
+                    <td>4.20</td>
+                    <td class="skip">— <sup>b</sup></td>
+                    <td>236.47</td>
+                </tr>
+            </tbody>
+        </table>
+        <p class="footnote">
+            Derived from the times above as <span class="figure">2 n³ / t</span>
+            (each output element is n multiply-adds, over n² outputs).
+            <strong>Peak per backend is bold.</strong> Each CPU backend
+            peaks where the working set still fits in cache and gets
+            memory-bandwidth-bound after; the GPU peaks at 2048² and stays
+            within a factor of ~1.4 across the rest. All numbers are a
+            small fraction of theoretical hardware peak because TornadoVM's
+            default triply-nested-loop kernel doesn't tile through
+            shared/local memory — the RTX 4060's FP32 peak is
+            <span class="figure">~11 000 GFLOPS</span> (a well-tuned
+            <span class="figure">cuBLAS SGEMM</span> lands close to that);
+            the Ryzen 7845HX with AVX-512 FMA is
+            <span class="figure">~1 500 GFLOPS</span>. What we're seeing is
+            the honest cost of a naive kernel across four dispatch paths,
+            not the hardware ceiling.
+        </p>
+    </section>
+
+    <section>
+        <h2>Reading the shape</h2>
+        <div class="obs">
+            <div class="obs-card">
+                <h3>Small sizes are transfer-dominated</h3>
+                <p>
+                    At 256², all three "parallel" backends lose to a single
+                    thread. The GPU pays a <span class="figure">~15 ms</span>
+                    PCIe+dispatch floor per op; POCL pays even more
+                    (<span class="figure">~34 ms</span>) because each kernel
+                    is a fresh TornadoVM task graph. Below the crossover
+                    around 512², a plain Java loop is the fastest thing on
+                    the machine.
+                </p>
+            </div>
+            <div class="obs-card">
+                <h3>Java streams and POCL are indistinguishable</h3>
+                <p>
+                    Both ultimately hit the same 16 cores. At 4096² they
+                    finish within <span class="figure">2%</span> of each
+                    other (<span class="figure">26.86 s</span> vs
+                    <span class="figure">27.42 s</span>). POCL's per-op
+                    task-graph overhead never quite amortizes for a workload
+                    this memory-bound — TornadoVM adds nothing over Java's
+                    Fork/Join here.
+                </p>
+            </div>
+            <div class="obs-card">
+                <h3>GPU speedup keeps growing</h3>
+                <p>
+                    Matmul is O(n³) work over O(n²) data, so every
+                    doubling of n triples the compute per unit of transfer.
+                    The GPU line goes from <span class="figure">3.8×</span>
+                    at 1024² to <span class="figure">39×</span> at 2048² to
+                    <span class="figure">41×</span> at 4096² to
+                    <span class="figure">56×</span> at 8192². The 4060's
+                    8 GB VRAM is only ¼ full at 8192² — the crossover keeps
+                    going.
+                </p>
+            </div>
+        </div>
+    </section>
+
+    <section>
+        <h2>System under test</h2>
+        <div class="setup">
+            <dl>
+                <dt>Host</dt>            <dd>WSL 2 · Ubuntu 24.04.4 LTS on Windows 11</dd>
+                <dt>CPU</dt>             <dd>AMD Ryzen 9 7845HX (16 cores / 32 threads, x86-64-v4 avx512)</dd>
+                <dt>GPU</dt>             <dd>NVIDIA RTX 4060 Laptop · 8 GB VRAM · PTX backend</dd>
+                <dt>JDK</dt>             <dd>Oracle GraalVM 25.0.3+9.1 LTS-jvmci-b01</dd>
+                <dt>TornadoVM</dt>       <dd>5.0.0-jdk25 · PTX variant for GPU · OpenCL variant for CPU</dd>
+                <dt>OpenCL runtime</dt>  <dd>POCL 6.0 (Portable Computing Language) — cpu-skylake-avx512</dd>
+                <dt>Benchmark</dt>       <dd>com.marmanis.jax4j.examples.BackendBenchmark · median of 5 runs after 2 warm-ups</dd>
+                <dt>Max FP32 err</dt>    <dd>3.20 × 10⁻⁴ at n = 8192 (order-dependent accumulation between backends)</dd>
+            </dl>
+        </div>
+    </section>
+</main>

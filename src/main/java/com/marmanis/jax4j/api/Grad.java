@@ -663,6 +663,181 @@ public class Grad {
         return new ConcreteNDArray(out, new Shape(cols, rows));
     }
 
+    public record ForwardAdResult(List<NDArray> primals, List<NDArray> tangents) {}
+
+    public static ForwardAdResult forwardAd(Jaxpr jaxpr, List<NDArray> argValues, List<NDArray> tangentValues) {
+        Map<Integer, NDArray> primals = new HashMap<>();
+        Map<Integer, NDArray> tangents = new HashMap<>();
+
+        for (Map.Entry<Integer, NDArray> entry : jaxpr.consts().entrySet()) {
+            primals.put(entry.getKey(), entry.getValue());
+            tangents.put(entry.getKey(), zerosLike(entry.getValue()));
+        }
+
+        for (int i = 0; i < jaxpr.inVars().size(); i++) {
+            primals.put(jaxpr.inVars().get(i).id(), argValues.get(i));
+            tangents.put(jaxpr.inVars().get(i).id(), tangentValues.get(i));
+        }
+
+        for (Equation eq : jaxpr.equations()) {
+            NDArray[] inPrimals = eq.inputs().stream().map(v -> primals.get(v.id())).toArray(NDArray[]::new);
+            NDArray[] inTangents = eq.inputs().stream().map(v -> tangents.get(v.id())).toArray(NDArray[]::new);
+
+            if (eq.primitive() == Primitive.SCAN) {
+                List<NDArray> outs = scanJVP(eq, inPrimals, inTangents);
+                primals.put(eq.outputs().get(0).id(), outs.get(0));
+                primals.put(eq.outputs().get(1).id(), outs.get(1));
+                tangents.put(eq.outputs().get(0).id(), outs.get(2));
+                tangents.put(eq.outputs().get(1).id(), outs.get(3));
+                continue;
+            }
+
+            NDArray outPrimal = executePrimitive(eq.primitive(), eq, inPrimals);
+            NDArray outTangent = computeJVP(eq.primitive(), eq, outPrimal, inPrimals, inTangents);
+
+            primals.put(eq.outputs().get(0).id(), outPrimal);
+            tangents.put(eq.outputs().get(0).id(), outTangent);
+        }
+
+        List<NDArray> outPrimals = jaxpr.outVars().stream().map(v -> primals.get(v.id())).toList();
+        List<NDArray> outTangents = jaxpr.outVars().stream().map(v -> tangents.get(v.id())).toList();
+        return new ForwardAdResult(outPrimals, outTangents);
+    }
+
+    private static List<NDArray> scanJVP(Equation eq, NDArray[] inPrimals, NDArray[] inTangents) {
+        ScanMeta m = (ScanMeta) eq.metadata();
+        NDArray carry = inPrimals[0];
+        NDArray xs = inPrimals[1];
+        NDArray carryT = inTangents[0];
+        NDArray xsT = inTangents[1];
+
+        int steps = xs.shape().dimensions()[0];
+        Shape xStepShape = ScanUtil.dropLeadingDim(xs.shape());
+
+        List<NDArray> ysList = new ArrayList<>(steps);
+        List<NDArray> ysTList = new ArrayList<>(steps);
+
+        for (int t = 0; t < steps; t++) {
+            NDArray xt = ScanUtil.sliceLeading(xs, t, xStepShape);
+            NDArray xtT = ScanUtil.sliceLeading(xsT, t, xStepShape);
+
+            ForwardAdResult stepOut = forwardAd(m.stepFn(), List.of(carry, xt), List.of(carryT, xtT));
+            carry = stepOut.primals().get(0);
+            carryT = stepOut.tangents().get(0);
+            ysList.add(stepOut.primals().get(1));
+            ysTList.add(stepOut.tangents().get(1));
+        }
+
+        return List.of(carry, ScanUtil.stackLeading(ysList), carryT, ScanUtil.stackLeading(ysTList));
+    }
+
+    private static NDArray computeJVP(Primitive p, Equation eq, NDArray primalOut, NDArray[] primals, NDArray[] tangents) {
+        DType dtype = primalOut.dtype();
+        Shape shape = primalOut.shape();
+        switch (p) {
+            case ADD -> {
+                return tangents[0].add(tangents[1]);
+            }
+            case SUB -> {
+                return tangents[0].sub(tangents[1]);
+            }
+            case MUL -> {
+                return tangents[0].mul(primals[1]).add(primals[0].mul(tangents[1]));
+            }
+            case DIV -> {
+                NDArray b = primals[1];
+                return tangents[0].mul(b).sub(primals[0].mul(tangents[1])).div(b.mul(b));
+            }
+            case MEAN -> {
+                return tangents[0].mean();
+            }
+            case SUM -> {
+                return tangents[0].sum();
+            }
+            case SUM_AXIS -> {
+                AxisMeta m = (AxisMeta) eq.metadata();
+                return tangents[0].sum(m.axis(), m.keepDims());
+            }
+            case MEAN_AXIS -> {
+                AxisMeta m = (AxisMeta) eq.metadata();
+                return tangents[0].mean(m.axis(), m.keepDims());
+            }
+            case EXP -> {
+                return tangents[0].mul(primalOut);
+            }
+            case LOG -> {
+                return tangents[0].div(primals[0]);
+            }
+            case SIN -> {
+                return tangents[0].mul(primals[0].cos());
+            }
+            case COS -> {
+                return tangents[0].mul(primals[0].sin()).mul(minusOne(shape, dtype));
+            }
+            case TANH -> {
+                NDArray t = primalOut;
+                return tangents[0].mul(ones(shape, dtype).sub(t.mul(t)));
+            }
+            case RELU -> {
+                NDArray zero = zeros(primals[0].shape(), primals[0].dtype());
+                return tangents[0].mul(primals[0].gt(zero).astype(primals[0].dtype()));
+            }
+            case SIGMOID -> {
+                NDArray s = primalOut;
+                return tangents[0].mul(s.mul(ones(shape, dtype).sub(s)));
+            }
+            case DOT -> {
+                return tangents[0].dot(primals[1]).add(primals[0].dot(tangents[1]));
+            }
+            case COND -> {
+                CondMeta m = (CondMeta) eq.metadata();
+                Jaxpr branch = (primals[0].toFloatArray()[0] != 0f) ? m.trueBranch() : m.falseBranch();
+                ForwardAdResult branchOut = forwardAd(branch, List.of(primals[1]), List.of(tangents[1]));
+                return branchOut.tangents().get(0);
+            }
+            case WHILE -> throw new UnsupportedOperationException("Lax.whileLoop is not forward-mode differentiable");
+            case CAST -> {
+                DType target = (DType) eq.metadata();
+                return tangents[0].astype(target);
+            }
+            case GATHER -> {
+                return Numpy.takeEager(tangents[0], primals[1]);
+            }
+            case GT, GE, LT, LE, EQ, NE, ARGMAX, ARGMIN -> {
+                return zeros(shape, dtype);
+            }
+            case CHECKPOINT -> {
+                CheckpointMeta m = (CheckpointMeta) eq.metadata();
+                ForwardAdResult cpOut = forwardAd(m.subJaxpr(), List.of(primals[0]), List.of(tangents[0]));
+                return cpOut.tangents().get(0);
+            }
+            case PMAP -> {
+                PmapMeta m = (PmapMeta) eq.metadata();
+                NDArray[] primalShards = Pmap.split(primals[0], m.numDevices());
+                NDArray[] tangentShards = Pmap.split(tangents[0], m.numDevices());
+                NDArray[] outPrimalShards = new NDArray[m.numDevices()];
+                NDArray[] outTangentShards = new NDArray[m.numDevices()];
+                for (int i = 0; i < m.numDevices(); i++) {
+                    ForwardAdResult res = forwardAd(m.bodyJaxpr(), List.of(primalShards[i]), List.of(tangentShards[i]));
+                    outPrimalShards[i] = res.primals().get(0);
+                    outTangentShards[i] = res.tangents().get(0);
+                }
+                return Pmap.stack(outTangentShards);
+            }
+            case PSUM -> {
+                PmapContext ctx = PmapContext.current();
+                if (ctx == null) return tangents[0];
+                return new ConcreteNDArray(ctx.collective.psum(ctx.deviceIndex, tangents[0].toFloatArray()), tangents[0].shape());
+            }
+            case ALL_GATHER -> {
+                PmapContext ctx = PmapContext.current();
+                if (ctx == null) return tangents[0];
+                return ctx.collective.allGather(ctx.deviceIndex, tangents[0]);
+            }
+            default -> throw new UnsupportedOperationException("No JVP rule defined for primitive: " + p);
+        }
+    }
+
     /** {@code dtype} if it's a floating dtype, else FLOAT32 — the safe default for an
      * inert zero-gradient placeholder on a non-differentiable (BOOL/INT32/INT64) input. */
     private static DType floatDtypeOrDefault(DType dtype) {

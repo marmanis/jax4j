@@ -14,11 +14,16 @@ import java.util.stream.IntStream;
 
 /**
  * A concrete implementation of NDArray that holds actual data in host memory.
- * Storage is genuinely typed: exactly one of {@code floatData}/{@code intData}/
- * {@code boolData}/{@code doubleData}/{@code longData} is populated, matching
- * {@link #dtype()} — there is no "float standing in for bool/int" representation
- * anywhere. Arithmetic (`add`/`mul`/.../`dot`/reductions) requires both operands
- * to share the same <em>floating</em> dtype (FLOAT32 or FLOAT64) and throws
+ * Storage is genuinely typed and held in a single {@link Storage} value — a
+ * sealed family with exactly one record per dtype, each wrapping one primitive
+ * array. There is no "float standing in for bool/int" representation anywhere,
+ * and — unlike the earlier five-parallel-nullable-fields layout — no way to
+ * represent a dtype/data mismatch: the record subtype <em>is</em> the dtype.
+ * Internal dispatch is a compiler-checked exhaustive {@code switch} over the
+ * storage rather than a hand-maintained {@code if (dtype == ...)} chain.
+ *
+ * <p>Arithmetic (`add`/`mul`/.../`dot`/reductions) requires both operands to
+ * share the same <em>floating</em> dtype (FLOAT32 or FLOAT64) and throws
  * otherwise; {@link #astype} is the explicit, principled way to convert.
  * FLOAT64 arithmetic always runs on the host (no TornadoVM kernel), unlike
  * FLOAT32 which dispatches to a device when explicitly placed.
@@ -29,70 +34,111 @@ public class ConcreteNDArray implements NDArray {
     private final Shape shape;
     private final DType dtype;
     private final Device device;
-    private final float[] floatData;
-    private final int[] intData;
-    private final boolean[] boolData;
-    private final double[] doubleData;
-    private final long[] longData;
+    private final Storage storage;
 
-    private ConcreteNDArray(float[] floatData, int[] intData, boolean[] boolData,
-                             double[] doubleData, long[] longData,
-                             Shape shape, DType dtype, Device device) {
-        this.floatData = floatData;
-        this.intData = intData;
-        this.boolData = boolData;
-        this.doubleData = doubleData;
-        this.longData = longData;
+    /**
+     * Typed backing store for a {@link ConcreteNDArray}: a sealed family with
+     * one record per dtype. Holding storage as a single sealed value (rather
+     * than five parallel nullable arrays) makes the dtype and the data
+     * inseparable, and lets every dtype-dependent method dispatch via an
+     * exhaustive {@code switch} the compiler checks. Array equality/hashing/
+     * printing lives here so callers don't reach back into raw arrays.
+     */
+    private sealed interface Storage {
+        DType dtype();
+        boolean dataEquals(Storage other);
+        int dataHashCode();
+        String dataString();
+    }
+
+    private record F32Storage(float[] data) implements Storage {
+        @Override public DType dtype() { return DType.FLOAT32; }
+        @Override public boolean dataEquals(Storage o) { return o instanceof F32Storage f && Arrays.equals(data, f.data); }
+        @Override public int dataHashCode() { return Arrays.hashCode(data); }
+        @Override public String dataString() { return Arrays.toString(data); }
+    }
+
+    private record F64Storage(double[] data) implements Storage {
+        @Override public DType dtype() { return DType.FLOAT64; }
+        @Override public boolean dataEquals(Storage o) { return o instanceof F64Storage f && Arrays.equals(data, f.data); }
+        @Override public int dataHashCode() { return Arrays.hashCode(data); }
+        @Override public String dataString() { return Arrays.toString(data); }
+    }
+
+    private record I32Storage(int[] data) implements Storage {
+        @Override public DType dtype() { return DType.INT32; }
+        @Override public boolean dataEquals(Storage o) { return o instanceof I32Storage f && Arrays.equals(data, f.data); }
+        @Override public int dataHashCode() { return Arrays.hashCode(data); }
+        @Override public String dataString() { return Arrays.toString(data); }
+    }
+
+    private record I64Storage(long[] data) implements Storage {
+        @Override public DType dtype() { return DType.INT64; }
+        @Override public boolean dataEquals(Storage o) { return o instanceof I64Storage f && Arrays.equals(data, f.data); }
+        @Override public int dataHashCode() { return Arrays.hashCode(data); }
+        @Override public String dataString() { return Arrays.toString(data); }
+    }
+
+    private record BoolStorage(boolean[] data) implements Storage {
+        @Override public DType dtype() { return DType.BOOL; }
+        @Override public boolean dataEquals(Storage o) { return o instanceof BoolStorage f && Arrays.equals(data, f.data); }
+        @Override public int dataHashCode() { return Arrays.hashCode(data); }
+        @Override public String dataString() { return Arrays.toString(data); }
+    }
+
+    /** Canonical constructor. Every public constructor funnels through here. */
+    private ConcreteNDArray(Storage storage, Shape shape, Device device) {
+        this.storage = storage;
         this.shape = shape;
-        this.dtype = dtype;
+        this.dtype = storage.dtype();
         this.device = device;
     }
 
     public ConcreteNDArray(float[] data, Shape shape, DType dtype, Device device) {
-        this(data, null, null, null, null, shape, requireFloat32Dtype(dtype), device);
+        this(f32Storage(data, dtype), shape, device);
     }
 
-    private static DType requireFloat32Dtype(DType dtype) {
+    private static F32Storage f32Storage(float[] data, DType dtype) {
         if (dtype != DType.FLOAT32) {
             throw new IllegalArgumentException("This constructor only accepts dtype FLOAT32, got " + dtype);
         }
-        return dtype;
+        return new F32Storage(data);
     }
 
     public ConcreteNDArray(float[] data, Shape shape) {
-        this(data, shape, DType.FLOAT32, Device.defaultDevice());
+        this(new F32Storage(data), shape, Device.defaultDevice());
     }
 
     public ConcreteNDArray(int[] data, Shape shape, Device device) {
-        this(null, data, null, null, null, shape, DType.INT32, device);
+        this(new I32Storage(data), shape, device);
     }
 
     public ConcreteNDArray(int[] data, Shape shape) {
-        this(data, shape, Device.defaultDevice());
+        this(new I32Storage(data), shape, Device.defaultDevice());
     }
 
     public ConcreteNDArray(boolean[] data, Shape shape, Device device) {
-        this(null, null, data, null, null, shape, DType.BOOL, device);
+        this(new BoolStorage(data), shape, device);
     }
 
     public ConcreteNDArray(boolean[] data, Shape shape) {
-        this(data, shape, Device.defaultDevice());
+        this(new BoolStorage(data), shape, Device.defaultDevice());
     }
 
     public ConcreteNDArray(double[] data, Shape shape, Device device) {
-        this(null, null, null, data, null, shape, DType.FLOAT64, device);
+        this(new F64Storage(data), shape, device);
     }
 
     public ConcreteNDArray(double[] data, Shape shape) {
-        this(data, shape, Device.defaultDevice());
+        this(new F64Storage(data), shape, Device.defaultDevice());
     }
 
     public ConcreteNDArray(long[] data, Shape shape, Device device) {
-        this(null, null, null, null, data, shape, DType.INT64, device);
+        this(new I64Storage(data), shape, device);
     }
 
     public ConcreteNDArray(long[] data, Shape shape) {
-        this(data, shape, Device.defaultDevice());
+        this(new I64Storage(data), shape, Device.defaultDevice());
     }
 
     @Override public Shape shape() { return shape; }
@@ -101,8 +147,18 @@ public class ConcreteNDArray implements NDArray {
 
     @Override
     public NDArray to(Device targetDevice) {
-        return new ConcreteNDArray(floatData, intData, boolData, doubleData, longData, shape, dtype, targetDevice);
+        return new ConcreteNDArray(storage, shape, targetDevice);
     }
+
+    // Typed views of the backing store. Each is only called from a branch
+    // that has already established the matching dtype (via the requireFloating
+    // guards, an explicit dtype check, or a storage switch), so the cast is
+    // always safe.
+    private float[]   f32() { return ((F32Storage) storage).data(); }
+    private double[]  f64() { return ((F64Storage) storage).data(); }
+    private int[]     i32() { return ((I32Storage) storage).data(); }
+    private long[]    i64() { return ((I64Storage) storage).data(); }
+    private boolean[] bl()  { return ((BoolStorage) storage).data(); }
 
     private void requireDtype(DType expected, String accessor) {
         if (dtype != expected) {
@@ -162,11 +218,22 @@ public class ConcreteNDArray implements NDArray {
      */
     private NDArray elementwise(NDArray other, Primitive primitive, DoubleBinaryOperator op,
                                  java.util.function.BiFunction<NDArray, NDArray, NDArray> tracedOp) {
-        if (other instanceof TracedNDArray || isTracing()) return tracedOp.apply(toTraced(), other);
+        if (dtype != other.dtype() || other instanceof TracedNDArray || isTracing()) {
+            DType target = DType.promote(this.dtype(), other.dtype());
+            NDArray left = (this.dtype() == target) ? this : this.astype(target);
+            NDArray right = (other.dtype() == target) ? other : other.astype(target);
+            if (left instanceof TracedNDArray || right instanceof TracedNDArray || isTracing()) {
+                NDArray leftTraced = left instanceof TracedNDArray ? left : ((ConcreteNDArray) left).toTraced();
+                NDArray rightTraced = right instanceof TracedNDArray ? right : ((ConcreteNDArray) right).toTraced();
+                return tracedOp.apply(leftTraced, rightTraced);
+            }
+            return ((ConcreteNDArray) left).elementwise(right, primitive, op, tracedOp);
+        }
 
         requireSameFloatingDtype(other, primitive.toString());
 
         if (dtype == DType.FLOAT64) {
+            double[] thisData = f64();
             double[] otherData = other.toDoubleArray();
             Shape outShape = Shape.broadcast(shape, other.shape());
             double[] result = new double[(int) outShape.size()];
@@ -174,13 +241,13 @@ public class ConcreteNDArray implements NDArray {
             Shape otherShape = other.shape();
             if (result.length > PARALLEL_THRESHOLD) {
                 IntStream.range(0, result.length).parallel().forEach(i -> {
-                    double v1 = doubleData[thisShape.broadcastIndex(outShape, i)];
+                    double v1 = thisData[thisShape.broadcastIndex(outShape, i)];
                     double v2 = otherData[otherShape.broadcastIndex(outShape, i)];
                     result[i] = op.applyAsDouble(v1, v2);
                 });
             } else {
                 for (int i = 0; i < result.length; i++) {
-                    double v1 = doubleData[thisShape.broadcastIndex(outShape, i)];
+                    double v1 = thisData[thisShape.broadcastIndex(outShape, i)];
                     double v2 = otherData[otherShape.broadcastIndex(outShape, i)];
                     result[i] = op.applyAsDouble(v1, v2);
                 }
@@ -188,6 +255,7 @@ public class ConcreteNDArray implements NDArray {
             return new ConcreteNDArray(result, outShape, device);
         }
 
+        float[] thisData = f32();
         float[] otherData = other.toFloatArray();
         Device otherDevice = other.device();
         boolean hostOnly = device.equals(Device.host()) && otherDevice.equals(Device.host());
@@ -198,7 +266,7 @@ public class ConcreteNDArray implements NDArray {
                     "Cannot combine arrays on different devices: " + device + " vs " + otherDevice);
             }
             if (shape.equals(other.shape())) {
-                float[] result = backendFor(device).binary(primitive, floatData, otherData, device);
+                float[] result = backendFor(device).binary(primitive, thisData, otherData, device);
                 return new ConcreteNDArray(result, shape, dtype, device);
             }
         }
@@ -210,13 +278,13 @@ public class ConcreteNDArray implements NDArray {
 
         if (result.length > PARALLEL_THRESHOLD) {
             IntStream.range(0, result.length).parallel().forEach(i -> {
-                float v1 = floatData[thisShape.broadcastIndex(outShape, i)];
+                float v1 = thisData[thisShape.broadcastIndex(outShape, i)];
                 float v2 = otherData[otherShape.broadcastIndex(outShape, i)];
                 result[i] = (float) op.applyAsDouble(v1, v2);
             });
         } else {
             for (int i = 0; i < result.length; i++) {
-                float v1 = floatData[thisShape.broadcastIndex(outShape, i)];
+                float v1 = thisData[thisShape.broadcastIndex(outShape, i)];
                 float v2 = otherData[otherShape.broadcastIndex(outShape, i)];
                 result[i] = (float) op.applyAsDouble(v1, v2);
             }
@@ -254,53 +322,62 @@ public class ConcreteNDArray implements NDArray {
      * FLOAT32/INT32/FLOAT64 compare via {@code test} (a lossless double
      * comparison in every one of those cases); INT64 compares as a genuine
      * {@code long} by switching on {@code primitive} directly, since casting
-     * a long through double would lose precision beyond 2^53.
+     * a long through double would lose precision beyond 2^53. BOOL is not
+     * comparable and throws.
      */
     private NDArray compareElementwise(NDArray other, Primitive primitive,
                                         java.util.function.BiPredicate<Double, Double> test,
                                         java.util.function.BiFunction<NDArray, NDArray, NDArray> tracedOp) {
-        if (other instanceof TracedNDArray || isTracing()) return tracedOp.apply(toTraced(), other);
-
-        if (dtype != other.dtype()) {
-            throw new IllegalArgumentException(
-                primitive + " requires both operands to share a dtype, got " + dtype + " and " + other.dtype()
-                    + " — use .astype() to convert.");
+        if (dtype != other.dtype() || other instanceof TracedNDArray || isTracing()) {
+            DType target = DType.promote(this.dtype(), other.dtype());
+            NDArray left = (this.dtype() == target) ? this : this.astype(target);
+            NDArray right = (other.dtype() == target) ? other : other.astype(target);
+            if (left instanceof TracedNDArray || right instanceof TracedNDArray || isTracing()) {
+                NDArray leftTraced = left instanceof TracedNDArray ? left : ((ConcreteNDArray) left).toTraced();
+                NDArray rightTraced = right instanceof TracedNDArray ? right : ((ConcreteNDArray) right).toTraced();
+                return tracedOp.apply(leftTraced, rightTraced);
+            }
+            return ((ConcreteNDArray) left).compareElementwise(right, primitive, test, tracedOp);
         }
 
         Shape outShape = Shape.broadcast(shape, other.shape());
         boolean[] result = new boolean[(int) outShape.size()];
 
-        switch (dtype) {
-            case FLOAT32 -> {
+        switch (storage) {
+            case F32Storage s -> {
+                float[] thisData = s.data();
                 float[] otherData = other.toFloatArray();
                 for (int i = 0; i < result.length; i++) {
-                    double v1 = floatData[shape.broadcastIndex(outShape, i)];
+                    double v1 = thisData[shape.broadcastIndex(outShape, i)];
                     double v2 = otherData[other.shape().broadcastIndex(outShape, i)];
                     result[i] = test.test(v1, v2);
                 }
             }
-            case FLOAT64 -> {
+            case F64Storage s -> {
+                double[] thisData = s.data();
                 double[] otherData = other.toDoubleArray();
                 for (int i = 0; i < result.length; i++) {
-                    double v1 = doubleData[shape.broadcastIndex(outShape, i)];
+                    double v1 = thisData[shape.broadcastIndex(outShape, i)];
                     double v2 = otherData[other.shape().broadcastIndex(outShape, i)];
                     result[i] = test.test(v1, v2);
                 }
             }
-            case INT32 -> {
+            case I32Storage s -> {
                 // Compared as double (lossless for int32, unlike a float cast) to
                 // avoid precision loss for indices beyond float32's 24-bit mantissa.
+                int[] thisData = s.data();
                 int[] otherData = other.toIntArray();
                 for (int i = 0; i < result.length; i++) {
-                    double v1 = intData[shape.broadcastIndex(outShape, i)];
+                    double v1 = thisData[shape.broadcastIndex(outShape, i)];
                     double v2 = otherData[other.shape().broadcastIndex(outShape, i)];
                     result[i] = test.test(v1, v2);
                 }
             }
-            case INT64 -> {
+            case I64Storage s -> {
+                long[] thisData = s.data();
                 long[] otherData = other.toLongArray();
                 for (int i = 0; i < result.length; i++) {
-                    long v1 = longData[shape.broadcastIndex(outShape, i)];
+                    long v1 = thisData[shape.broadcastIndex(outShape, i)];
                     long v2 = otherData[other.shape().broadcastIndex(outShape, i)];
                     result[i] = switch (primitive) {
                         case GT -> v1 > v2;
@@ -313,7 +390,7 @@ public class ConcreteNDArray implements NDArray {
                     };
                 }
             }
-            default -> throw new IllegalArgumentException(
+            case BoolStorage s -> throw new IllegalArgumentException(
                 primitive + " requires FLOAT32, INT32, FLOAT64, or INT64 operands, got " + dtype);
         }
         return new ConcreteNDArray(result, outShape, device);
@@ -328,26 +405,37 @@ public class ConcreteNDArray implements NDArray {
 
     @Override
     public NDArray dot(NDArray other) {
-        if (other instanceof TracedNDArray) return toTraced().dot(other);
-        if (isTracing()) return toTraced().dot(other);
+        if (dtype != other.dtype() || other instanceof TracedNDArray || isTracing()) {
+            DType target = DType.promote(this.dtype(), other.dtype());
+            NDArray left = (this.dtype() == target) ? this : this.astype(target);
+            NDArray right = (other.dtype() == target) ? other : other.astype(target);
+            if (left instanceof TracedNDArray || right instanceof TracedNDArray || isTracing()) {
+                NDArray leftTraced = left instanceof TracedNDArray ? left : ((ConcreteNDArray) left).toTraced();
+                NDArray rightTraced = right instanceof TracedNDArray ? right : ((ConcreteNDArray) right).toTraced();
+                return leftTraced.dot(rightTraced);
+            }
+            return ((ConcreteNDArray) left).dot(right);
+        }
         requireSameFloatingDtype(other, "dot");
         int M = shape.dimensions()[0];
         int K = shape.dimensions()[1];
         int N = other.shape().dimensions()[1];
 
         if (dtype == DType.FLOAT64) {
+            double[] thisData = f64();
             double[] otherData = other.toDoubleArray();
             double[] result = new double[M * N];
             for (int i = 0; i < M; i++) {
                 for (int j = 0; j < N; j++) {
                     double sum = 0;
-                    for (int k = 0; k < K; k++) sum += doubleData[i * K + k] * otherData[k * N + j];
+                    for (int k = 0; k < K; k++) sum += thisData[i * K + k] * otherData[k * N + j];
                     result[i * N + j] = sum;
                 }
             }
             return new ConcreteNDArray(result, new Shape(M, N), device);
         }
 
+        float[] thisData = f32();
         float[] otherData = other.toFloatArray();
         Device otherDevice = other.device();
 
@@ -357,7 +445,7 @@ public class ConcreteNDArray implements NDArray {
                 throw new IllegalStateException(
                     "Cannot combine arrays on different devices: " + device + " vs " + otherDevice);
             }
-            float[] result = backendFor(device).matmul(floatData, otherData, M, K, N, device);
+            float[] result = backendFor(device).matmul(thisData, otherData, M, K, N, device);
             return new ConcreteNDArray(result, new Shape(M, N), dtype, device);
         }
 
@@ -365,7 +453,7 @@ public class ConcreteNDArray implements NDArray {
         for (int i = 0; i < M; i++) {
             for (int j = 0; j < N; j++) {
                 float sum = 0;
-                for (int k = 0; k < K; k++) sum += floatData[i * K + k] * otherData[k * N + j];
+                for (int k = 0; k < K; k++) sum += thisData[i * K + k] * otherData[k * N + j];
                 result[i * N + j] = sum;
             }
         }
@@ -375,28 +463,26 @@ public class ConcreteNDArray implements NDArray {
     @Override public NDArray sum() {
         if (isTracing()) return toTraced().sum();
         requireFloatingDtype("sum");
+        ExecutionBackend backend = backendFor(device);
         if (dtype == DType.FLOAT64) {
-            double sum = 0;
-            for (double v : doubleData) sum += v;
-            return new ConcreteNDArray(new double[]{sum}, new Shape(1), device);
+            double[] res = backend.reduce(Primitive.SUM, f64(), device);
+            return new ConcreteNDArray(res, new Shape(1), device);
         }
-        float sum = 0;
-        for (float v : floatData) sum += v;
-        return new ConcreteNDArray(new float[]{sum}, new Shape(1), dtype, device);
+        float[] res = backend.reduce(Primitive.SUM, f32(), device);
+        return new ConcreteNDArray(res, new Shape(1), dtype, device);
     }
 
     @Override
     public NDArray mean() {
         if (isTracing()) return toTraced().mean();
         requireFloatingDtype("mean");
+        ExecutionBackend backend = backendFor(device);
         if (dtype == DType.FLOAT64) {
-            double sum = 0;
-            for (double v : doubleData) sum += v;
-            return new ConcreteNDArray(new double[]{sum / doubleData.length}, new Shape(1), device);
+            double[] res = backend.reduce(Primitive.MEAN, f64(), device);
+            return new ConcreteNDArray(res, new Shape(1), device);
         }
-        float sum = 0;
-        for (float v : floatData) sum += v;
-        return new ConcreteNDArray(new float[]{sum / floatData.length}, new Shape(1), dtype, device);
+        float[] res = backend.reduce(Primitive.MEAN, f32(), device);
+        return new ConcreteNDArray(res, new Shape(1), dtype, device);
     }
 
     @Override
@@ -433,27 +519,29 @@ public class ConcreteNDArray implements NDArray {
         Shape outShape = shape.reduceAxis(norm, keepDims);
 
         if (dtype == DType.FLOAT64) {
+            double[] in = f64();
             double[] out = new double[(int) outShape.size()];
             for (int o = 0; o < outerSize; o++) {
-                for (int in = 0; in < innerSize; in++) {
+                for (int inr = 0; inr < innerSize; inr++) {
                     double total = 0;
                     for (int a = 0; a < axisSize; a++) {
-                        total += doubleData[o * axisSize * innerSize + a * innerSize + in];
+                        total += in[o * axisSize * innerSize + a * innerSize + inr];
                     }
-                    out[o * innerSize + in] = mean ? total / axisSize : total;
+                    out[o * innerSize + inr] = mean ? total / axisSize : total;
                 }
             }
             return new ConcreteNDArray(out, outShape, device);
         }
 
+        float[] in = f32();
         float[] out = new float[(int) outShape.size()];
         for (int o = 0; o < outerSize; o++) {
-            for (int in = 0; in < innerSize; in++) {
+            for (int inr = 0; inr < innerSize; inr++) {
                 float total = 0;
                 for (int a = 0; a < axisSize; a++) {
-                    total += floatData[o * axisSize * innerSize + a * innerSize + in];
+                    total += in[o * axisSize * innerSize + a * innerSize + inr];
                 }
-                out[o * innerSize + in] = mean ? total / axisSize : total;
+                out[o * innerSize + inr] = mean ? total / axisSize : total;
             }
         }
         return new ConcreteNDArray(out, outShape, dtype, device);
@@ -493,35 +581,37 @@ public class ConcreteNDArray implements NDArray {
         int[] out = new int[(int) outShape.size()];
 
         if (dtype == DType.FLOAT64) {
+            double[] in = f64();
             for (int o = 0; o < outerSize; o++) {
-                for (int in = 0; in < innerSize; in++) {
+                for (int inr = 0; inr < innerSize; inr++) {
                     int bestIdx = 0;
-                    double best = doubleData[o * axisSize * innerSize + in];
+                    double best = in[o * axisSize * innerSize + inr];
                     for (int a = 1; a < axisSize; a++) {
-                        double v = doubleData[o * axisSize * innerSize + a * innerSize + in];
+                        double v = in[o * axisSize * innerSize + a * innerSize + inr];
                         if (max ? v > best : v < best) {
                             best = v;
                             bestIdx = a;
                         }
                     }
-                    out[o * innerSize + in] = bestIdx;
+                    out[o * innerSize + inr] = bestIdx;
                 }
             }
             return new ConcreteNDArray(out, outShape, device);
         }
 
+        float[] in = f32();
         for (int o = 0; o < outerSize; o++) {
-            for (int in = 0; in < innerSize; in++) {
+            for (int inr = 0; inr < innerSize; inr++) {
                 int bestIdx = 0;
-                float best = floatData[o * axisSize * innerSize + in];
+                float best = in[o * axisSize * innerSize + inr];
                 for (int a = 1; a < axisSize; a++) {
-                    float v = floatData[o * axisSize * innerSize + a * innerSize + in];
+                    float v = in[o * axisSize * innerSize + a * innerSize + inr];
                     if (max ? v > best : v < best) {
                         best = v;
                         bestIdx = a;
                     }
                 }
-                out[o * innerSize + in] = bestIdx;
+                out[o * innerSize + inr] = bestIdx;
             }
         }
         return new ConcreteNDArray(out, outShape, device);
@@ -539,25 +629,27 @@ public class ConcreteNDArray implements NDArray {
         requireFloatingDtype(primitive.toString());
 
         if (dtype == DType.FLOAT64) {
-            double[] result = new double[doubleData.length];
+            double[] in = f64();
+            double[] result = new double[in.length];
             if (result.length > PARALLEL_THRESHOLD) {
-                IntStream.range(0, result.length).parallel().forEach(i -> result[i] = op.applyAsDouble(doubleData[i]));
+                IntStream.range(0, result.length).parallel().forEach(i -> result[i] = op.applyAsDouble(in[i]));
             } else {
-                for (int i = 0; i < result.length; i++) result[i] = op.applyAsDouble(doubleData[i]);
+                for (int i = 0; i < result.length; i++) result[i] = op.applyAsDouble(in[i]);
             }
             return new ConcreteNDArray(result, shape, device);
         }
 
+        float[] in = f32();
         if (!device.equals(Device.host())) {
-            float[] result = backendFor(device).unary(primitive, floatData, device);
+            float[] result = backendFor(device).unary(primitive, in, device);
             return new ConcreteNDArray(result, shape, dtype, device);
         }
 
-        float[] result = new float[floatData.length];
+        float[] result = new float[in.length];
         if (result.length > PARALLEL_THRESHOLD) {
-            IntStream.range(0, result.length).parallel().forEach(i -> result[i] = (float) op.applyAsDouble(floatData[i]));
+            IntStream.range(0, result.length).parallel().forEach(i -> result[i] = (float) op.applyAsDouble(in[i]));
         } else {
-            for (int i = 0; i < result.length; i++) result[i] = (float) op.applyAsDouble(floatData[i]);
+            for (int i = 0; i < result.length; i++) result[i] = (float) op.applyAsDouble(in[i]);
         }
         return new ConcreteNDArray(result, shape, dtype, device);
     }
@@ -581,10 +673,10 @@ public class ConcreteNDArray implements NDArray {
             case FLOAT32 -> {
                 float[] out = new float[n];
                 switch (dtype) {
-                    case INT32 -> { for (int i = 0; i < n; i++) out[i] = intData[i]; }
-                    case BOOL -> { for (int i = 0; i < n; i++) out[i] = boolData[i] ? 1f : 0f; }
-                    case FLOAT64 -> { for (int i = 0; i < n; i++) out[i] = (float) doubleData[i]; }
-                    case INT64 -> { for (int i = 0; i < n; i++) out[i] = longData[i]; }
+                    case INT32 -> { int[] in = i32(); for (int i = 0; i < n; i++) out[i] = in[i]; }
+                    case BOOL -> { boolean[] in = bl(); for (int i = 0; i < n; i++) out[i] = in[i] ? 1f : 0f; }
+                    case FLOAT64 -> { double[] in = f64(); for (int i = 0; i < n; i++) out[i] = (float) in[i]; }
+                    case INT64 -> { long[] in = i64(); for (int i = 0; i < n; i++) out[i] = in[i]; }
                     default -> throw new IllegalStateException("Unsupported cast " + dtype + " -> " + target);
                 }
                 return new ConcreteNDArray(out, shape, DType.FLOAT32, device);
@@ -592,10 +684,10 @@ public class ConcreteNDArray implements NDArray {
             case INT32 -> {
                 int[] out = new int[n];
                 switch (dtype) {
-                    case FLOAT32 -> { for (int i = 0; i < n; i++) out[i] = (int) floatData[i]; } // truncates toward zero
-                    case BOOL -> { for (int i = 0; i < n; i++) out[i] = boolData[i] ? 1 : 0; }
-                    case FLOAT64 -> { for (int i = 0; i < n; i++) out[i] = (int) doubleData[i]; } // truncates toward zero
-                    case INT64 -> { for (int i = 0; i < n; i++) out[i] = (int) longData[i]; } // narrows, may overflow
+                    case FLOAT32 -> { float[] in = f32(); for (int i = 0; i < n; i++) out[i] = (int) in[i]; } // truncates toward zero
+                    case BOOL -> { boolean[] in = bl(); for (int i = 0; i < n; i++) out[i] = in[i] ? 1 : 0; }
+                    case FLOAT64 -> { double[] in = f64(); for (int i = 0; i < n; i++) out[i] = (int) in[i]; } // truncates toward zero
+                    case INT64 -> { long[] in = i64(); for (int i = 0; i < n; i++) out[i] = (int) in[i]; } // narrows, may overflow
                     default -> throw new IllegalStateException("Unsupported cast " + dtype + " -> " + target);
                 }
                 return new ConcreteNDArray(out, shape, device);
@@ -603,10 +695,10 @@ public class ConcreteNDArray implements NDArray {
             case BOOL -> {
                 boolean[] out = new boolean[n];
                 switch (dtype) {
-                    case FLOAT32 -> { for (int i = 0; i < n; i++) out[i] = floatData[i] != 0f; }
-                    case INT32 -> { for (int i = 0; i < n; i++) out[i] = intData[i] != 0; }
-                    case FLOAT64 -> { for (int i = 0; i < n; i++) out[i] = doubleData[i] != 0.0; }
-                    case INT64 -> { for (int i = 0; i < n; i++) out[i] = longData[i] != 0L; }
+                    case FLOAT32 -> { float[] in = f32(); for (int i = 0; i < n; i++) out[i] = in[i] != 0f; }
+                    case INT32 -> { int[] in = i32(); for (int i = 0; i < n; i++) out[i] = in[i] != 0; }
+                    case FLOAT64 -> { double[] in = f64(); for (int i = 0; i < n; i++) out[i] = in[i] != 0.0; }
+                    case INT64 -> { long[] in = i64(); for (int i = 0; i < n; i++) out[i] = in[i] != 0L; }
                     default -> throw new IllegalStateException("Unsupported cast " + dtype + " -> " + target);
                 }
                 return new ConcreteNDArray(out, shape, device);
@@ -614,10 +706,10 @@ public class ConcreteNDArray implements NDArray {
             case FLOAT64 -> {
                 double[] out = new double[n];
                 switch (dtype) {
-                    case FLOAT32 -> { for (int i = 0; i < n; i++) out[i] = floatData[i]; }
-                    case INT32 -> { for (int i = 0; i < n; i++) out[i] = intData[i]; }
-                    case BOOL -> { for (int i = 0; i < n; i++) out[i] = boolData[i] ? 1.0 : 0.0; }
-                    case INT64 -> { for (int i = 0; i < n; i++) out[i] = longData[i]; }
+                    case FLOAT32 -> { float[] in = f32(); for (int i = 0; i < n; i++) out[i] = in[i]; }
+                    case INT32 -> { int[] in = i32(); for (int i = 0; i < n; i++) out[i] = in[i]; }
+                    case BOOL -> { boolean[] in = bl(); for (int i = 0; i < n; i++) out[i] = in[i] ? 1.0 : 0.0; }
+                    case INT64 -> { long[] in = i64(); for (int i = 0; i < n; i++) out[i] = in[i]; }
                     default -> throw new IllegalStateException("Unsupported cast " + dtype + " -> " + target);
                 }
                 return new ConcreteNDArray(out, shape, device);
@@ -625,10 +717,10 @@ public class ConcreteNDArray implements NDArray {
             case INT64 -> {
                 long[] out = new long[n];
                 switch (dtype) {
-                    case FLOAT32 -> { for (int i = 0; i < n; i++) out[i] = (long) floatData[i]; } // truncates toward zero
-                    case INT32 -> { for (int i = 0; i < n; i++) out[i] = intData[i]; }
-                    case BOOL -> { for (int i = 0; i < n; i++) out[i] = boolData[i] ? 1L : 0L; }
-                    case FLOAT64 -> { for (int i = 0; i < n; i++) out[i] = (long) doubleData[i]; } // truncates toward zero
+                    case FLOAT32 -> { float[] in = f32(); for (int i = 0; i < n; i++) out[i] = (long) in[i]; } // truncates toward zero
+                    case INT32 -> { int[] in = i32(); for (int i = 0; i < n; i++) out[i] = in[i]; }
+                    case BOOL -> { boolean[] in = bl(); for (int i = 0; i < n; i++) out[i] = in[i] ? 1L : 0L; }
+                    case FLOAT64 -> { double[] in = f64(); for (int i = 0; i < n; i++) out[i] = (long) in[i]; } // truncates toward zero
                     default -> throw new IllegalStateException("Unsupported cast " + dtype + " -> " + target);
                 }
                 return new ConcreteNDArray(out, shape, device);
@@ -640,47 +732,36 @@ public class ConcreteNDArray implements NDArray {
     @Override
     public float[] toFloatArray() {
         requireDtype(DType.FLOAT32, "toFloatArray");
-        return floatData;
+        return f32();
     }
 
     @Override
     public int[] toIntArray() {
         requireDtype(DType.INT32, "toIntArray");
-        return intData;
+        return i32();
     }
 
     @Override
     public boolean[] toBoolArray() {
         requireDtype(DType.BOOL, "toBoolArray");
-        return boolData;
+        return bl();
     }
 
     @Override
     public double[] toDoubleArray() {
         requireDtype(DType.FLOAT64, "toDoubleArray");
-        return doubleData;
+        return f64();
     }
 
     @Override
     public long[] toLongArray() {
         requireDtype(DType.INT64, "toLongArray");
-        return longData;
+        return i64();
     }
 
     @Override
     public String toString() {
-        return "Array(" + activeDataString() + ", shape=" + shape + ", dtype=" + dtype + ")";
-    }
-
-    private String activeDataString() {
-        return switch (dtype) {
-            case FLOAT32 -> Arrays.toString(floatData);
-            case INT32 -> Arrays.toString(intData);
-            case BOOL -> Arrays.toString(boolData);
-            case FLOAT64 -> Arrays.toString(doubleData);
-            case INT64 -> Arrays.toString(longData);
-            default -> "<unsupported dtype " + dtype + ">";
-        };
+        return "Array(" + storage.dataString() + ", shape=" + shape + ", dtype=" + dtype + ")";
     }
 
     @Override
@@ -688,26 +769,11 @@ public class ConcreteNDArray implements NDArray {
         if (this == o) return true;
         if (!(o instanceof ConcreteNDArray other)) return false;
         if (!shape.equals(other.shape) || dtype != other.dtype) return false;
-        return switch (dtype) {
-            case FLOAT32 -> Arrays.equals(floatData, other.floatData);
-            case INT32 -> Arrays.equals(intData, other.intData);
-            case BOOL -> Arrays.equals(boolData, other.boolData);
-            case FLOAT64 -> Arrays.equals(doubleData, other.doubleData);
-            case INT64 -> Arrays.equals(longData, other.longData);
-            default -> false;
-        };
+        return storage.dataEquals(other.storage);
     }
 
     @Override
     public int hashCode() {
-        int dataHash = switch (dtype) {
-            case FLOAT32 -> Arrays.hashCode(floatData);
-            case INT32 -> Arrays.hashCode(intData);
-            case BOOL -> Arrays.hashCode(boolData);
-            case FLOAT64 -> Arrays.hashCode(doubleData);
-            case INT64 -> Arrays.hashCode(longData);
-            default -> 0;
-        };
-        return dataHash * 31 + shape.hashCode();
+        return storage.dataHashCode() * 31 + shape.hashCode();
     }
 }

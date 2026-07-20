@@ -2,10 +2,12 @@ package com.marmanis.jax4j;
 
 import com.marmanis.jax4j.api.Linalg;
 import com.marmanis.jax4j.core.ConcreteNDArray;
+import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.Shape;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
@@ -257,5 +259,255 @@ public class LinalgTest {
         NDArray A = mat(2, 1, 2, 3, 4);
         NDArray b = vec(1, 2, 3);
         assertThrows(IllegalArgumentException.class, () -> Linalg.solve(A, b));
+    }
+
+    // -----------------------------------------------------------------
+    // LU factorisation (cached) — tests
+    // -----------------------------------------------------------------
+
+    @Test
+    public void testLuSolveMatchesLinalgSolve() {
+        NDArray A = mat(3,
+            2, 1, 1,
+            1, 3, 2,
+            1, 0, 0);
+        NDArray b = vec(4, 5, 6);
+        double[] viaSolve = Linalg.solve(A, b).toDoubleArray();
+        double[] viaLu    = Linalg.lu(A).solve(b).toDoubleArray();
+        for (int i = 0; i < 3; i++) assertClose(viaSolve[i], viaLu[i], 1e-14, "match[" + i + "]");
+    }
+
+    @Test
+    public void testLuReusableAcrossMultipleRHS() {
+        // Factor once, solve three different RHS. Each result must match a
+        // fresh Linalg.solve(A, b_k) to full precision.
+        int n = 10;
+        java.util.Random rng = new java.util.Random(1729);
+        double[] a = new double[n * n];
+        for (int i = 0; i < n * n; i++) a[i] = rng.nextGaussian();
+        for (int i = 0; i < n; i++) a[i * n + i] += n;      // diag boost
+        NDArray A = new ConcreteNDArray(a, new Shape(n, n));
+        Linalg.LU lu = Linalg.lu(A);
+        assertEquals(n, lu.n(), "lu.n()");
+        for (int rep = 0; rep < 3; rep++) {
+            double[] bData = new double[n];
+            for (int i = 0; i < n; i++) bData[i] = rng.nextGaussian();
+            NDArray b = new ConcreteNDArray(bData, new Shape(n));
+            double[] fresh  = Linalg.solve(A, b).toDoubleArray();
+            double[] cached = lu.solve(b).toDoubleArray();
+            for (int i = 0; i < n; i++) {
+                assertClose(fresh[i], cached[i], 1e-13, "rep " + rep + "[" + i + "]");
+            }
+        }
+    }
+
+    @Test
+    public void testLuRawDoubleSolveMatchesNDArrayPath() {
+        NDArray A = mat(3,
+            2, 1, 1,
+            1, 3, 2,
+            1, 0, 0);
+        double[] bRaw = {4, 5, 6};
+        Linalg.LU lu = Linalg.lu(A);
+        double[] viaRaw     = lu.solve(bRaw);
+        double[] viaNDArray = lu.solve(new ConcreteNDArray(bRaw.clone(), new Shape(3))).toDoubleArray();
+        for (int i = 0; i < 3; i++) assertClose(viaNDArray[i], viaRaw[i], 1e-14, "raw==nd[" + i + "]");
+    }
+
+    @Test
+    public void testLuFloat32() {
+        // Both A and b FLOAT32; verify solve returns FLOAT32 and value is close.
+        float[] aFlat = {2f, 1f, 1f, 1f, 3f, 2f, 1f, 0f, 0f};
+        NDArray A = new ConcreteNDArray(aFlat, new Shape(3, 3));
+        NDArray b = new ConcreteNDArray(new float[]{4f, 5f, 6f}, new Shape(3));
+        NDArray x = Linalg.lu(A).solve(b);
+        assertEquals(DType.FLOAT32, x.dtype(), "FLOAT32 RHS -> FLOAT32 result");
+        // xTrue = [6, 15, -23] (see testSolveKnownSystem).
+        float[] out = x.toFloatArray();
+        assertClose(6.0, out[0], 1e-4, "f32 x0");
+        assertClose(15.0, out[1], 1e-4, "f32 x1");
+        assertClose(-23.0, out[2], 1e-4, "f32 x2");
+    }
+
+    @Test
+    public void testLuMixedDtypeFloat64MatrixFloat32Rhs() {
+        // Factor a FLOAT64 matrix, solve against a FLOAT32 RHS. Result
+        // dtype matches the RHS; the factorisation is FLOAT64 internally.
+        NDArray A = mat(3,
+            2, 1, 1,
+            1, 3, 2,
+            1, 0, 0);
+        NDArray b32 = new ConcreteNDArray(new float[]{4f, 5f, 6f}, new Shape(3));
+        NDArray x = Linalg.lu(A).solve(b32);
+        assertEquals(DType.FLOAT32, x.dtype(), "FLOAT32 RHS -> FLOAT32 result");
+        float[] out = x.toFloatArray();
+        assertClose(6.0, out[0], 1e-4, "mix x0");
+        assertClose(15.0, out[1], 1e-4, "mix x1");
+        assertClose(-23.0, out[2], 1e-4, "mix x2");
+    }
+
+    @Test
+    public void testLuOnSingularMatrixThrows() {
+        NDArray A = mat(3,
+            1, 2, 3,
+            2, 4, 6,
+            0, 0, 1);
+        assertThrows(IllegalArgumentException.class, () -> Linalg.lu(A));
+    }
+
+    @Test
+    public void testLuSolveRejectsWrongLengthRhs() {
+        NDArray A = mat(3, 1, 0, 0, 0, 1, 0, 0, 0, 1);
+        Linalg.LU lu = Linalg.lu(A);
+        NDArray bTooShort = vec(1, 2);
+        assertThrows(IllegalArgumentException.class, () -> lu.solve(bTooShort));
+    }
+
+    @Test
+    public void testLuOnNonSquareThrows() {
+        NDArray A = new ConcreteNDArray(new double[]{1, 2, 3, 4, 5, 6}, new Shape(2, 3));
+        assertThrows(IllegalArgumentException.class, () -> Linalg.lu(A));
+    }
+
+    // -----------------------------------------------------------------
+    // SingularityCheck modes and cond(A) — tests
+    // -----------------------------------------------------------------
+
+    private static NDArray hilbert(int n) {
+        double[] h = new double[n * n];
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) h[i * n + j] = 1.0 / (i + j + 1);
+        }
+        return new ConcreteNDArray(h, new Shape(n, n));
+    }
+
+    @Test
+    public void testLuNoArgUsesSubmatrixMaxDefault() {
+        // Explicit and default should behave identically on a garden-variety
+        // system: same solution to full precision.
+        NDArray A = mat(3, 2, 1, 1, 1, 3, 2, 1, 0, 0);
+        NDArray b = vec(4, 5, 6);
+        double[] viaDefault  = Linalg.lu(A).solve(b).toDoubleArray();
+        double[] viaExplicit = Linalg.lu(A,
+            Linalg.SingularityCheck.SINGULARITY_CHECK_SUBMATRIX_MAX).solve(b).toDoubleArray();
+        for (int i = 0; i < 3; i++) {
+            assertClose(viaDefault[i], viaExplicit[i], 1e-14, "match[" + i + "]");
+        }
+    }
+
+    @Test
+    public void testLuSubmatrixMaxRejectsRankDeficient() {
+        // Two equal rows -> rank deficient; SUBMATRIX_MAX must reject
+        // (pivot in the collapsed column falls below eps × ‖A‖_max).
+        NDArray A = mat(3,
+            1, 2, 3,
+            2, 4, 6,
+            0, 0, 1);
+        assertThrows(IllegalArgumentException.class, () -> Linalg.lu(A,
+            Linalg.SingularityCheck.SINGULARITY_CHECK_SUBMATRIX_MAX));
+    }
+
+    @Test
+    public void testLuReciprocalCondEstAcceptsModeratelyConditioned() {
+        // Hilbert(4) has κ_∞ ≈ 2.8e4 — comfortably below the 1e14 gate.
+        NDArray A = hilbert(4);
+        NDArray b = vec(1, 1, 1, 1);
+        // Solve should succeed; residual should be small.
+        NDArray x = Linalg.solve(A, b,
+            Linalg.SingularityCheck.SINGULARITY_CHECK_RECIPROCAL_CONDITION_EST);
+        double[] xArr = x.toDoubleArray();
+        double[] aArr = A.toDoubleArray();
+        double[] bArr = b.toDoubleArray();
+        for (int i = 0; i < 4; i++) {
+            double s = 0;
+            for (int j = 0; j < 4; j++) s += aArr[i * 4 + j] * xArr[j];
+            assertClose(bArr[i], s, 1e-9, "residual[" + i + "]");
+        }
+    }
+
+    @Test
+    public void testLuReciprocalCondEstRejectsHilbert15() {
+        // Hilbert(15) has κ_∞ ≈ 10²¹ — deep past the RCOND gate. Under
+        // SUBMATRIX_MAX it may or may not throw depending on which pivot
+        // squeaks by; under RECIPROCAL_CONDITION_EST it must reject.
+        NDArray A = hilbert(15);
+        assertThrows(IllegalArgumentException.class, () -> Linalg.lu(A,
+            Linalg.SingularityCheck.SINGULARITY_CHECK_RECIPROCAL_CONDITION_EST));
+    }
+
+    @Test
+    public void testCondIdentityIsOne() {
+        NDArray I = mat(4,
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1);
+        double kappa = Linalg.cond(I);
+        assertClose(1.0, kappa, 1e-13, "cond(I) = 1");
+    }
+
+    @Test
+    public void testCondDiagonalIsRatioOfExtremes() {
+        // cond_∞(diag(d)) = max|d| / min|d|.
+        NDArray A = mat(3,
+            1, 0, 0,
+            0, 2, 0,
+            0, 0, 4);
+        double kappa = Linalg.cond(A);
+        // Exact answer is 4 (= 4/1); Hager should hit it exactly on this
+        // trivial case.
+        assertClose(4.0, kappa, 1e-12, "cond(diag(1,2,4))");
+    }
+
+    @Test
+    public void testCondHilbert5MatchesPublished() {
+        // Textbook value κ_∞(H_5) ≈ 9.44e5. Hager gives a lower-bound
+        // estimate — allow a factor of ~3 for the underestimate.
+        NDArray H = hilbert(5);
+        double kappa = Linalg.cond(H);
+        if (kappa < 3e5 || kappa > 3e6) {
+            throw new AssertionError("cond(Hilbert(5)) out of expected range: " + kappa);
+        }
+    }
+
+    @Test
+    public void testCondStructurallySingularIsInfinity() {
+        // Row of zeros -> exact-zero pivot -> +∞.
+        NDArray A = mat(3,
+            1, 2, 3,
+            0, 0, 0,
+            4, 5, 6);
+        double kappa = Linalg.cond(A);
+        if (!Double.isInfinite(kappa) || kappa < 0) {
+            throw new AssertionError("expected +Infinity for singular, got " + kappa);
+        }
+    }
+
+    @Test
+    public void testCondWellScaledIllConditionedIsLarge() {
+        // A that's not structurally singular but has a very small pivot
+        // relative to the largest entry — κ should be > 1e10.
+        NDArray A = mat(2,
+            1.0, 1.0,
+            1.0, 1.0 + 1e-12);
+        double kappa = Linalg.cond(A);
+        if (kappa < 1e10) {
+            throw new AssertionError("expected cond > 1e10 for near-singular, got " + kappa);
+        }
+    }
+
+    @Test
+    public void testSolveWithExplicitCheckMatchesDefault() {
+        NDArray A = mat(3, 2, 1, 1, 1, 3, 2, 1, 0, 0);
+        NDArray b = vec(4, 5, 6);
+        double[] def = Linalg.solve(A, b).toDoubleArray();
+        double[] sm  = Linalg.solve(A, b,
+            Linalg.SingularityCheck.SINGULARITY_CHECK_SUBMATRIX_MAX).toDoubleArray();
+        double[] rc  = Linalg.solve(A, b,
+            Linalg.SingularityCheck.SINGULARITY_CHECK_RECIPROCAL_CONDITION_EST).toDoubleArray();
+        for (int i = 0; i < 3; i++) {
+            assertClose(def[i], sm[i], 1e-14, "def==sm[" + i + "]");
+            assertClose(def[i], rc[i], 1e-14, "def==rc[" + i + "]");
+        }
     }
 }

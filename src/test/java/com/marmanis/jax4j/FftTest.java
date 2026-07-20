@@ -227,4 +227,129 @@ public class FftTest {
         assertEquals(1, y.shape().dimensions()[0]);
         assertClose(3.14, y.toDoubleArray()[0], 1e-15, "length-1 dctI");
     }
+
+    // -----------------------------------------------------------------
+    // dctIRaw — raw-double[] overload used by chebfun4j's hot path
+    // -----------------------------------------------------------------
+
+    @Test
+    public void testDctIRawMatchesNdArrayVersion() {
+        // Bit-for-bit match at every representative grid size chebfun4j
+        // actually hits (adaptive constructor probes 3, 5, 9, 17, 33, ..., 65537).
+        int[] sizes = {3, 5, 9, 17, 33, 65, 129, 257};
+        java.util.Random rng = new java.util.Random(0xC4EBF00D);
+        for (int n : sizes) {
+            double[] x = new double[n];
+            for (int i = 0; i < n; i++) x[i] = rng.nextGaussian();
+            double[] viaRaw = Fft.dctIRaw(x);
+            double[] viaNd  = Fft.dctI(new ConcreteNDArray(x.clone(), new Shape(n))).toDoubleArray();
+            for (int k = 0; k < n; k++) {
+                if (viaRaw[k] != viaNd[k]) {
+                    throw new AssertionError(
+                        "dctIRaw vs dctI diverge at n=" + n + " k=" + k
+                            + ": raw=" + viaRaw[k] + " nd=" + viaNd[k]);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testDctIRawDoesNotMutateInput() {
+        int n = 33;
+        double[] x = new double[n];
+        java.util.Random rng = new java.util.Random(0xBADF00D);
+        for (int i = 0; i < n; i++) x[i] = rng.nextGaussian();
+        double[] snapshot = x.clone();
+        double[] unused = Fft.dctIRaw(x);
+        for (int i = 0; i < n; i++) {
+            if (x[i] != snapshot[i]) {
+                throw new AssertionError("dctIRaw mutated input at i=" + i);
+            }
+        }
+        // Prevent dead-store elimination.
+        if (unused.length != n) throw new AssertionError();
+    }
+
+    @Test
+    public void testDctIRawLengthOneReturnsFreshCopy() {
+        double[] x = {3.14};
+        double[] y = Fft.dctIRaw(x);
+        assertClose(3.14, y[0], 1e-15, "length-1 value");
+        // Not aliased — mutating one must not affect the other.
+        y[0] = 0.0;
+        assertClose(3.14, x[0], 1e-15, "input not aliased");
+    }
+
+    @Test
+    public void testDctIRawRejectsInvalidLength() {
+        // n = 6 -> n - 1 = 5, not a power of two.
+        assertThrows(IllegalArgumentException.class,
+            () -> Fft.dctIRaw(new double[]{1, 2, 3, 4, 5, 6}));
+        // Empty array rejected.
+        assertThrows(IllegalArgumentException.class,
+            () -> Fft.dctIRaw(new double[0]));
+    }
+
+    @Test
+    public void testFft3Ifft3RoundTripDouble() {
+        int n0 = 8, n1 = 8, n2 = 8;
+        int size = n0 * n1 * n2;
+        double[] re = new double[size];
+        double[] im = new double[size];
+        java.util.Random rng = new java.util.Random(123);
+        for (int i = 0; i < size; i++) {
+            re[i] = rng.nextGaussian();
+            im[i] = rng.nextGaussian();
+        }
+        NDArray reN = new ConcreteNDArray(re.clone(), new Shape(n0, n1, n2));
+        NDArray imN = new ConcreteNDArray(im.clone(), new Shape(n0, n1, n2));
+        NDArray[] fwd = Fft.fft3(reN, imN);
+        NDArray[] back = Fft.ifft3(fwd[0], fwd[1]);
+        double[] backRe = back[0].toDoubleArray();
+        double[] backIm = back[1].toDoubleArray();
+        double tol = 1e-12;
+        for (int i = 0; i < size; i++) {
+            assertClose(re[i], backRe[i], tol, "fft3 double roundtrip real at " + i);
+            assertClose(im[i], backIm[i], tol, "fft3 double roundtrip imag at " + i);
+        }
+    }
+
+    @Test
+    public void testRfft3Irfft3RoundTripDouble() {
+        int n0 = 8, n1 = 8, n2 = 8;
+        int size = n0 * n1 * n2;
+        double[] src = new double[size];
+        java.util.Random rng = new java.util.Random(456);
+        for (int i = 0; i < size; i++) {
+            src[i] = rng.nextGaussian();
+        }
+        NDArray in = new ConcreteNDArray(src.clone(), new Shape(n0, n1, n2));
+        NDArray[] fwd = Fft.rfft3(in);
+        NDArray back = Fft.irfft3(fwd[0], fwd[1]);
+        double[] backData = back.toDoubleArray();
+        double tol = 1e-12;
+        for (int i = 0; i < size; i++) {
+            assertClose(src[i], backData[i], tol, "rfft3 double roundtrip at " + i);
+        }
+    }
+
+    @Test
+    public void testRfft3Irfft3RoundTripFloat() {
+        int n0 = 8, n1 = 4, n2 = 16;
+        int size = n0 * n1 * n2;
+        float[] src = new float[size];
+        java.util.Random rng = new java.util.Random(789);
+        for (int i = 0; i < size; i++) {
+            src[i] = (float) rng.nextGaussian();
+        }
+        NDArray in = new ConcreteNDArray(src.clone(), new Shape(n0, n1, n2));
+        NDArray[] fwd = Fft.rfft3(in);
+        NDArray back = Fft.irfft3(fwd[0], fwd[1]);
+        float[] backData = back.toFloatArray();
+        double tol = 1e-4;
+        for (int i = 0; i < size; i++) {
+            assertClose(src[i], backData[i], tol, "rfft3 float roundtrip at " + i);
+        }
+    }
 }
+

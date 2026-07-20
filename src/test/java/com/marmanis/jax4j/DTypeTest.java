@@ -13,6 +13,7 @@ import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
@@ -46,6 +47,34 @@ public class DTypeTest {
         assertThrows(IllegalStateException.class, () -> bools(true).toFloatArray());
         assertThrows(IllegalStateException.class, () -> floats(1f).toIntArray());
         assertThrows(IllegalStateException.class, () -> floats(1f).toBoolArray());
+    }
+
+    @Test
+    void allFiveDtypesRoundTripThroughStorage() {
+        // Exercises the sealed Storage family end to end: construct, read back
+        // dtype, read back the typed array. FLOAT64/INT64 are the two the
+        // shorter typedStorageRoundTrips test doesn't cover.
+        assertArrayEquals(new float[]{1, 2, 3}, floats(1, 2, 3).toFloatArray(), 0f);
+        assertArrayEquals(new double[]{1, 2, 3}, doubles(1, 2, 3).toDoubleArray(), 0.0);
+        assertArrayEquals(new int[]{1, 2, 3}, ints(1, 2, 3).toIntArray());
+        assertArrayEquals(new long[]{1L, 2L, 3L}, longs(1L, 2L, 3L).toLongArray());
+        assertArrayEquals(new boolean[]{true, false}, bools(true, false).toBoolArray());
+        assertEquals(DType.FLOAT64, doubles(1).dtype());
+        assertEquals(DType.INT64, longs(1L).dtype());
+    }
+
+    @Test
+    void equalsAndHashCodeRespectDtypeAndData() {
+        // Same numeric values, different dtypes -> not equal (dtype is part of
+        // identity, and the storage subtype differs).
+        assertNotEquals(floats(1, 2, 3), doubles(1, 2, 3));
+        assertNotEquals(ints(1, 2, 3), longs(1L, 2L, 3L));
+        // Same dtype + same data -> equal, with matching hashCode.
+        assertEquals(doubles(1, 2, 3), doubles(1, 2, 3));
+        assertEquals(doubles(1, 2, 3).hashCode(), doubles(1, 2, 3).hashCode());
+        assertEquals(longs(7L, 8L), longs(7L, 8L));
+        // Same dtype, different data -> not equal.
+        assertNotEquals(doubles(1, 2, 3), doubles(1, 2, 4));
     }
 
     // ---- astype ----
@@ -98,10 +127,17 @@ public class DTypeTest {
     // ---- arithmetic dtype guard ----
 
     @Test
-    void arithmeticOnNonFloatThrows() {
+    void arithmeticOnNonFloatPromotes() {
+        NDArray result = bools(true, false).add(floats(1f, 2f));
+        assertEquals(DType.FLOAT32, result.dtype());
+        assertArrayEquals(new float[]{2f, 2f}, result.toFloatArray(), 1e-6f);
+    }
+
+    @Test
+    void arithmeticOnNonFloatingPromotedTypeThrows() {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
-            () -> bools(true, false).add(floats(1f, 2f)));
-        assertTrue(e.getMessage().contains("astype"));
+            () -> ints(1).add(ints(1)));
+        assertTrue(e.getMessage().contains("requires FLOAT32 or FLOAT64"));
     }
 
     @Test
@@ -118,8 +154,10 @@ public class DTypeTest {
     // ---- comparisons ----
 
     @Test
-    void comparisonDtypeMismatchThrows() {
-        assertThrows(IllegalArgumentException.class, () -> floats(1f).gt(ints(1)));
+    void comparisonDtypeMismatchPromotes() {
+        NDArray result = floats(1f).gt(ints(1));
+        assertEquals(DType.BOOL, result.dtype());
+        assertArrayEquals(new boolean[]{false}, result.toBoolArray());
     }
 
     @Test
@@ -244,10 +282,10 @@ public class DTypeTest {
     }
 
     @Test
-    void float32AndFloat64ArithmeticMixDisallowed() {
-        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
-            () -> floats(1f).add(doubles(1.0)));
-        assertTrue(e.getMessage().contains("astype"));
+    void float32AndFloat64ArithmeticMixPromotes() {
+        NDArray result = floats(1f).add(doubles(1.0));
+        assertEquals(DType.FLOAT64, result.dtype());
+        assertArrayEquals(new double[]{2.0}, result.toDoubleArray(), 1e-12);
     }
 
     @Test

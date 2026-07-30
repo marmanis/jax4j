@@ -12,7 +12,7 @@
         <maven.compiler.source>25</maven.compiler.source>
         <maven.compiler.target>25</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <tornadovm.version>5.0.0-jdk25</tornadovm.version>
+        <tornadovm.version>5.2.0-jdk25</tornadovm.version>
         <junit.version>5.10.2</junit.version>
         <slf4j.version>2.0.12</slf4j.version>
         <logback.version>1.5.3</logback.version>

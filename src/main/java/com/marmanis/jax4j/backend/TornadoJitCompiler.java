@@ -19,6 +19,10 @@ import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 
 import java.util.*;
 
+/**
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
+ */
+
 public class TornadoJitCompiler {
     private static final Logger log = LoggerFactory.getLogger(TornadoJitCompiler.class);
 

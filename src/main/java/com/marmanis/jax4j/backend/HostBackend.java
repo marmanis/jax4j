@@ -7,6 +7,7 @@ import com.marmanis.jax4j.ir.Primitive;
  * Default execution backend: plain Java loops on the JVM host. Used for
  * {@link Device#host()} and as the fallback target when {@link TornadoVMBackend}
  * can't run (no configured TornadoVM runtime, kernel failure, etc).
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class HostBackend implements ExecutionBackend {
     public static final HostBackend INSTANCE = new HostBackend();

@@ -7,6 +7,7 @@ import java.util.Arrays;
  * This is an immutable record using Java 25 features.
  * 
  * @param dimensions The size of each dimension.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public record Shape(int... dimensions) {
     public Shape {

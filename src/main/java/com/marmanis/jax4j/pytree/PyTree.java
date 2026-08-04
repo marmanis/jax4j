@@ -16,6 +16,7 @@ import java.util.Map;
  * node types) covering the common cases: a single array, an ordered list of
  * sub-trees (e.g. positional parameters), or a named map of sub-trees (e.g.
  * {@code {"w": ..., "b": ...}} model parameters).
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public sealed interface PyTree permits PyTree.Leaf, PyTree.ListNode, PyTree.MapNode {
 

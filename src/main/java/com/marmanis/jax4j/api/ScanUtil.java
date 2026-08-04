@@ -11,6 +11,7 @@ import java.util.List;
  * Leading-axis slice/stack helpers shared by {@link Lax#scan} (building the
  * per-step example shapes and the eager fallback) and {@link Grad}'s SCAN
  * forward/backward interpreters.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 final class ScanUtil {
     private ScanUtil() {}

@@ -7,6 +7,7 @@ import com.marmanis.jax4j.ir.Primitive;
  * Executes a single elementwise primitive over raw float data on a given device.
  * Implementations are looked up per-{@link Device} (see {@code ConcreteNDArray.backendFor}):
  * {@link HostBackend} for {@link Device#host()}, {@link TornadoVMBackend} otherwise.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public interface ExecutionBackend {
     /** Computes {@code a <primitive> b} elementwise; {@code a} and {@code b} must be the same length. */

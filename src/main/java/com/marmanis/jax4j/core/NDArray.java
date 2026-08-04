@@ -3,6 +3,7 @@ package com.marmanis.jax4j.core;
 /**
  * Interface for N-dimensional arrays in jax4j.
  * Supports both concrete data and traced variables for transformations.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public interface NDArray {
     Shape shape();
@@ -111,6 +112,42 @@ public interface NDArray {
 
     /** Equivalent to {@link #toFloatArray()} for {@link DType#INT64} arrays. */
     long[] toLongArray();
+
+    /**
+     * Returns a view with the same data but a different shape, mirroring
+     * {@code jax.numpy.reshape}. The total number of elements must be
+     * unchanged. Works for all dtypes.
+     */
+    NDArray reshape(Shape newShape);
+
+    /** Convenience overload: {@code reshape(new Shape(dims))}. */
+    default NDArray reshape(int... dims) { return reshape(new Shape(dims)); }
+
+    /**
+     * Permutes the axes of this array, mirroring {@code jax.numpy.transpose}.
+     * {@code axes[i]} is the axis of the input that maps to output axis {@code i}.
+     * For a 2-D matrix, {@code transpose(1, 0)} is the usual matrix transpose.
+     */
+    NDArray transpose(int... axes);
+
+    /**
+     * Reverses all axes (the default numpy/jax transpose with no arguments),
+     * i.e. {@code transpose(rank-1, rank-2, ..., 0)}.
+     */
+    default NDArray transpose() {
+        int rank = shape().rank();
+        int[] axes = new int[rank];
+        for (int i = 0; i < rank; i++) axes[i] = rank - 1 - i;
+        return transpose(axes);
+    }
+
+    /**
+     * Pads every dimension with zeros. {@code padding[i] = {before_i, after_i}}
+     * gives the number of zero-elements to prepend and append to dimension {@code i}.
+     * Mirroring {@code jax.numpy.pad} with {@code mode='constant'} and
+     * {@code constant_values=0}.
+     */
+    NDArray pad(int[][] padding);
 
     /**
      * Converts to a different dtype, mirroring {@code jax.numpy.astype}. This

@@ -13,6 +13,7 @@ import com.marmanis.jax4j.core.Shape;
  * from {@code exp}/{@code sum(axis, keepDims)}/{@code div} — the axis-aware
  * {@code sum} keeps the row-sum differentiable via {@code SUM_AXIS}'s VJP
  * rule without needing a dedicated softmax primitive.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public final class Nn {
     private Nn() {}

@@ -2,6 +2,7 @@ package com.marmanis.jax4j.ir;
 
 /**
  * Atomic operations in jax4j.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public enum Primitive {
     ADD("add"),
@@ -39,7 +40,18 @@ public enum Primitive {
     CAST("cast"),
     GATHER("gather"),
     FFI_CALL("ffi_call"),
-    CHECKPOINT("checkpoint");
+    CHECKPOINT("checkpoint"),
+    RESHAPE("reshape"),
+    TRANSPOSE("transpose"),
+    CONCAT("concat"),
+    PAD("pad"),
+    SCATTER_ADD("scatter_add"),
+    FFT("fft"),
+    IFFT("ifft"),
+    LINALG_SOLVE("linalg_solve"),
+    LINALG_SVD("linalg_svd"),
+    LINALG_EIG("linalg_eig"),
+    CUSTOM_VJP("custom_vjp");
 
     private final String name;
 

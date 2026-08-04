@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * The {@code ThreadLocal} gives us the same thread-confinement guarantee
  * that {@code ScopedValue} provides, without requiring callers to restructure
  * around a callback boundary.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class Tracer {
     private static final ThreadLocal<Deque<Tracer>> stackHolder =

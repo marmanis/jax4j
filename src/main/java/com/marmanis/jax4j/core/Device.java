@@ -11,6 +11,7 @@ import java.util.List;
 
 /**
  * Wrapper for TornadoVM hardware devices.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class Device {
     private static final Logger log = LoggerFactory.getLogger(Device.class);

@@ -12,6 +12,7 @@ import java.util.function.Function;
 
 /**
  * Foreign Function Interface for jax4j.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class FFI {
     private static final Map<String, FFITarget> targets = new HashMap<>();

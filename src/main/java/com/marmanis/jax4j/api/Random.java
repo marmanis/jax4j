@@ -32,6 +32,7 @@ import com.marmanis.jax4j.core.Shape;
  * in a batch (e.g. per-example dropout), sample directly at the batch-inclusive
  * shape — {@code Random.bernoulli(key, p, new Shape(batchSize, ...))} — rather
  * than vmapping over an array of keys.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public final class Random {
     private Random() {}

@@ -14,6 +14,7 @@ import java.util.function.Function;
  * Flatten/unflatten/map utilities over {@link PyTree}, mirroring the role of
  * {@code jax.tree_util} (e.g. {@code tree_flatten}, {@code tree_unflatten},
  * {@code tree_map}) in upstream JAX.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public final class PyTrees {
     private PyTrees() {}

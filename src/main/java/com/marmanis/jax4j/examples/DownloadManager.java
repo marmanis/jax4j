@@ -23,6 +23,7 @@ import java.util.zip.GZIPInputStream;
  * parses them into {@link NDArray}s (pixels scaled to {@code [0, 1]},
  * labels one-hot encoded), mirroring {@code datasets.mnist_raw()} and
  * {@code datasets.mnist()}.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class DownloadManager {
 

@@ -14,6 +14,7 @@ import java.util.Arrays;
 
 /**
  * Examples for the jax4j Foreign Function Interface.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class FFIExamples {
 

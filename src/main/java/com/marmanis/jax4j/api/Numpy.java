@@ -4,12 +4,14 @@ import com.marmanis.jax4j.core.ConcreteNDArray;
 import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.Shape;
+import com.marmanis.jax4j.ir.ConcatMeta;
 import com.marmanis.jax4j.ir.Equation;
 import com.marmanis.jax4j.ir.Primitive;
 import com.marmanis.jax4j.ir.Var;
 import com.marmanis.jax4j.tracing.TracedNDArray;
 import com.marmanis.jax4j.tracing.Tracer;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -22,6 +24,7 @@ import java.util.List;
  * <p>{@link #take} is a genuine new primitive ({@code GATHER}) — an embedding
  * lookup table can't be built from existing elementwise ops, since it needs an
  * actual indexed read.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public final class Numpy {
     private Numpy() {}
@@ -82,5 +85,168 @@ public final class Numpy {
         System.arraycopy(dims, 0, out, 0, dims.length);
         out[dims.length] = n;
         return new Shape(out);
+    }
+
+    /**
+     * Concatenates a list of arrays along {@code axis}, mirroring
+     * {@code jax.numpy.concatenate}. All arrays must share the same dtype
+     * and the same shape in every dimension except {@code axis}.
+     * Differentiable: the VJP splits the incoming gradient along {@code axis}.
+     */
+    public static NDArray concatenate(List<NDArray> arrays, int axis) {
+        if (arrays.isEmpty()) throw new IllegalArgumentException("concatenate: empty list");
+        DType dtype = arrays.get(0).dtype();
+        int rank = arrays.get(0).shape().rank();
+        int normAxis = axis < 0 ? rank + axis : axis;
+
+        int[] outDims = arrays.get(0).shape().dimensions().clone();
+        for (int i = 1; i < arrays.size(); i++) {
+            outDims[normAxis] += arrays.get(i).shape().dimensions()[normAxis];
+        }
+        Shape outShape = new Shape(outDims);
+
+        if (isTracing()) {
+            Tracer tracer = Tracer.current();
+            List<Var> inVars = arrays.stream().map(a -> {
+                if (a instanceof TracedNDArray t) return t.getVar();
+                return tracer.nextConstant(a);
+            }).toList();
+            Var outVar = tracer.nextVar(outShape, dtype);
+            tracer.addEquation(new Equation(inVars, List.of(outVar), Primitive.CONCAT, new ConcatMeta(normAxis)));
+            return new TracedNDArray(outVar);
+        }
+
+        return concatenateEager(arrays, normAxis, outShape, dtype);
+    }
+
+    /** Eager concatenation; also used by Grad's forward re-interpretation. */
+    public static NDArray concatenateEager(List<NDArray> arrays, int axis, Shape outShape, DType dtype) {
+        int size = (int) outShape.size();
+        int rank = outShape.rank();
+        int[] outDims = outShape.dimensions();
+
+        // Compute output strides (row-major)
+        int[] outStrides = new int[rank];
+        outStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--) outStrides[i] = outStrides[i + 1] * outDims[i + 1];
+
+        if (dtype == DType.FLOAT64) {
+            double[] out = new double[size];
+            int offset = 0;
+            for (NDArray arr : arrays) {
+                double[] src = arr.toDoubleArray();
+                int[] srcDims = arr.shape().dimensions();
+                int[] srcStrides = new int[rank];
+                srcStrides[rank - 1] = 1;
+                for (int i = rank - 2; i >= 0; i--) srcStrides[i] = srcStrides[i + 1] * srcDims[i + 1];
+                int srcSize = (int) arr.shape().size();
+                for (int srcFlat = 0; srcFlat < srcSize; srcFlat++) {
+                    int rem = srcFlat;
+                    int[] coords = new int[rank];
+                    for (int i = rank - 1; i >= 0; i--) { coords[i] = rem % srcDims[i]; rem /= srcDims[i]; }
+                    coords[axis] += offset;
+                    int outFlat = 0;
+                    for (int i = 0; i < rank; i++) outFlat += coords[i] * outStrides[i];
+                    out[outFlat] = src[srcFlat];
+                }
+                offset += srcDims[axis];
+            }
+            return new ConcreteNDArray(out, outShape);
+        }
+
+        float[] out = new float[size];
+        int offset = 0;
+        for (NDArray arr : arrays) {
+            float[] src = arr.toFloatArray();
+            int[] srcDims = arr.shape().dimensions();
+            int srcSize = (int) arr.shape().size();
+            int[] srcStrides = new int[rank];
+            srcStrides[rank - 1] = 1;
+            for (int i = rank - 2; i >= 0; i--) srcStrides[i] = srcStrides[i + 1] * srcDims[i + 1];
+            for (int srcFlat = 0; srcFlat < srcSize; srcFlat++) {
+                int rem = srcFlat;
+                int[] coords = new int[rank];
+                for (int i = rank - 1; i >= 0; i--) { coords[i] = rem % srcDims[i]; rem /= srcDims[i]; }
+                coords[axis] += offset;
+                int outFlat = 0;
+                for (int i = 0; i < rank; i++) outFlat += coords[i] * outStrides[i];
+                out[outFlat] = src[srcFlat];
+            }
+            offset += srcDims[axis];
+        }
+        return new ConcreteNDArray(out, outShape);
+    }
+
+    /**
+     * Stacks arrays along a new axis, mirroring {@code jax.numpy.stack}.
+     * Each input must have the same shape; a new axis of size
+     * {@code arrays.size()} is inserted at position {@code axis}.
+     */
+    public static NDArray stack(List<NDArray> arrays, int axis) {
+        if (arrays.isEmpty()) throw new IllegalArgumentException("stack: empty list");
+        List<NDArray> expanded = new ArrayList<>(arrays.size());
+        for (NDArray a : arrays) expanded.add(a.reshape(insertDim(a.shape(), axis)));
+        return concatenate(expanded, axis);
+    }
+
+    private static Shape insertDim(Shape shape, int axis) {
+        int rank = shape.rank();
+        int normAxis = axis < 0 ? rank + 1 + axis : axis;
+        int[] dims = shape.dimensions();
+        int[] out = new int[rank + 1];
+        for (int i = 0; i < normAxis; i++) out[i] = dims[i];
+        out[normAxis] = 1;
+        for (int i = normAxis; i < rank; i++) out[i + 1] = dims[i];
+        return new Shape(out);
+    }
+
+    /**
+     * Slices {@code x} along {@code axis} in range {@code [start, end)}.
+     * Used internally by Grad's CONCAT VJP.
+     */
+    static NDArray sliceAxis(NDArray x, int axis, int start, int end) {
+        int rank = x.shape().rank();
+        int[] dims = x.shape().dimensions();
+        int[] outDims = dims.clone();
+        outDims[axis] = end - start;
+        Shape outShape = new Shape(outDims);
+        int size = (int) outShape.size();
+        int[] outStrides = new int[rank];
+        outStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--) outStrides[i] = outStrides[i + 1] * outDims[i + 1];
+        int[] inStrides = new int[rank];
+        inStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--) inStrides[i] = inStrides[i + 1] * dims[i + 1];
+
+        if (x.dtype() == DType.FLOAT64) {
+            double[] in = x.toDoubleArray();
+            double[] out = new double[size];
+            for (int outFlat = 0; outFlat < size; outFlat++) {
+                int rem = outFlat;
+                int inFlat = 0;
+                for (int i = rank - 1; i >= 0; i--) {
+                    int coord = rem % outDims[i];
+                    rem /= outDims[i];
+                    int inCoord = (i == axis) ? coord + start : coord;
+                    inFlat += inCoord * inStrides[i];
+                }
+                out[outFlat] = in[inFlat];
+            }
+            return new ConcreteNDArray(out, outShape);
+        }
+        float[] in = x.toFloatArray();
+        float[] out = new float[size];
+        for (int outFlat = 0; outFlat < size; outFlat++) {
+            int rem = outFlat;
+            int inFlat = 0;
+            for (int i = rank - 1; i >= 0; i--) {
+                int coord = rem % outDims[i];
+                rem /= outDims[i];
+                int inCoord = (i == axis) ? coord + start : coord;
+                inFlat += inCoord * inStrides[i];
+            }
+            out[outFlat] = in[inFlat];
+        }
+        return new ConcreteNDArray(out, outShape);
     }
 }

@@ -4,6 +4,13 @@ import com.marmanis.jax4j.core.ConcreteNDArray;
 import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.Shape;
+import com.marmanis.jax4j.ir.Equation;
+import com.marmanis.jax4j.ir.Primitive;
+import com.marmanis.jax4j.ir.Var;
+import com.marmanis.jax4j.tracing.TracedNDArray;
+import com.marmanis.jax4j.tracing.Tracer;
+
+import java.util.List;
 
 /**
  * Dense real linear-algebra primitives, mirroring the shape of
@@ -16,6 +23,7 @@ import com.marmanis.jax4j.core.Shape;
  * href="../../../../../../chebfun4j/README.md">chebfun4j</a> project needs:
  * {@link #solve} for spectral-collocation BVP solves (chebop) and
  * {@link #eig} for colleague-matrix rootfinding on Chebyshev series.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public final class Linalg {
     private Linalg() {}
@@ -80,7 +88,23 @@ public final class Linalg {
      * once and reuse the returned {@link LU} — the O(n³) factorisation is
      * paid once, each subsequent {@link LU#solve} is O(n²).
      */
+    private static boolean isTracing() { return Tracer.current() != null; }
+
+    private static Var toVar(NDArray a) {
+        if (a instanceof TracedNDArray t) return t.getVar();
+        return Tracer.current().nextConstant(a);
+    }
+
     public static NDArray solve(NDArray A, NDArray b) {
+        if (isTracing()) {
+            Tracer tracer = Tracer.current();
+            Var aVar = toVar(A);
+            Var bVar = toVar(b);
+            int n = b.shape().dimensions()[0];
+            Var outVar = tracer.nextVar(new Shape(n), b.dtype());
+            tracer.addEquation(new Equation(List.of(aVar, bVar), List.of(outVar), Primitive.LINALG_SOLVE, null));
+            return new TracedNDArray(outVar);
+        }
         return solve(A, b, SingularityCheck.SINGULARITY_CHECK_SUBMATRIX_MAX);
     }
 

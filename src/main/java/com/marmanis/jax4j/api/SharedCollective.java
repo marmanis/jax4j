@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * backward each get their own instance). The {@link CyclicBarrier} resets
  * automatically after each await, so the same collective object can be used for
  * multiple sequential collective ops within the body function.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 final class SharedCollective {
 

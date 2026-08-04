@@ -31,6 +31,7 @@ import java.util.function.Function;
  *
  * <p>Every shard runs in its own thread with a {@link PmapContext} set, giving
  * collective ops access to the {@link SharedCollective} barrier.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 final class Pmap {
     private Pmap() {}

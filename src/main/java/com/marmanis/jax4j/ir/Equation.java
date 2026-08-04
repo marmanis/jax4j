@@ -5,6 +5,7 @@ import java.util.List;
 /**
  * Represents an equation in a Jaxpr: out = primitive(in1, in2, ...)
  * Supports optional metadata (e.g. for FFI target names).
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public record Equation(List<Var> inputs, List<Var> outputs, Primitive primitive, Object metadata) {
     public Equation(List<Var> inputs, List<Var> outputs, Primitive primitive) {

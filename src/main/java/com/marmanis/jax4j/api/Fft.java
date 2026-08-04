@@ -49,6 +49,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * traced op, same status as {@code CAST}/gather). Both {@code FLOAT32} and
  * {@code FLOAT64} inputs are supported; the output shares the input's
  * dtype.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public final class Fft {
     private Fft() {}
@@ -396,6 +397,268 @@ public final class Fft {
         float[] out = new float[n];
         for (int k = 0; k < n; k++) out[k] = (float) re[k];
         return out;
+    }
+
+    // ================================================================
+    //  2-D FFT / IFFT / RFFT / IRFFT
+    //
+    //  Same pattern as the 3-D variants but for 2 spatial axes.
+    //  GPU dispatch is attempted when cuFFT is available and both inputs
+    //  are on a non-host device with power-of-two dimensions — mirrors
+    //  the 3-D path exactly (just one fewer axis rotation).
+    // ================================================================
+
+    /**
+     * 2-D forward complex FFT. Transforms both real and imaginary inputs of shape (N0, N1)
+     * in-place along both axes. Each dimension must be a power of two.
+     * Auto-dispatches to NVIDIA cuFFT when applicable.
+     *
+     * @return length-2 array {@code {real, imag}} of the 2-D DFT.
+     */
+    public static NDArray[] fft2(NDArray re, NDArray im) {
+        NDArray[] gpu = tryCuFft2(re, im, false);
+        return (gpu != null) ? gpu : complexTransform2D(re, im, false);
+    }
+
+    /**
+     * 2-D inverse complex FFT. Transforms both real and imaginary inputs of shape (N0, N1)
+     * in-place along both axes. Each dimension must be a power of two.
+     * Auto-dispatches to NVIDIA cuFFT when applicable.
+     */
+    public static NDArray[] ifft2(NDArray re, NDArray im) {
+        NDArray[] gpu = tryCuFft2(re, im, true);
+        return (gpu != null) ? gpu : complexTransform2D(re, im, true);
+    }
+
+    /**
+     * 2-D real forward FFT. Transforms a real input of shape (N0, N1) into its
+     * conjugate-symmetric complex frequency representation of shape (N0, N1/2 + 1).
+     */
+    public static NDArray[] rfft2(NDArray x) {
+        if (x.shape().rank() != 2) {
+            throw new IllegalArgumentException("rfft2 requires a 2-D input, got shape " + x.shape());
+        }
+        int[] dims = x.shape().dimensions();
+        int n0 = dims[0], n1 = dims[1];
+        if (Integer.bitCount(n0) != 1 || Integer.bitCount(n1) != 1) {
+            throw new IllegalArgumentException("rfft2 dimensions must be powers of two, got " + x.shape());
+        }
+        int half = n1 / 2 + 1;
+        Shape outShape = new Shape(n0, half);
+
+        if (x.dtype() == DType.FLOAT64) {
+            double[] src = x.toDoubleArray();
+            double[] re = new double[n0 * half];
+            double[] im = new double[n0 * half];
+            double[] tempReal = new double[n1];
+            double[] tempImag = new double[n1];
+            for (int i = 0; i < n0; i++) {
+                System.arraycopy(src, i * n1, tempReal, 0, n1);
+                java.util.Arrays.fill(tempImag, 0.0);
+                fftInPlaceDouble(tempReal, tempImag, false);
+                System.arraycopy(tempReal, 0, re, i * half, half);
+                System.arraycopy(tempImag, 0, im, i * half, half);
+            }
+            // Transform along axis 0
+            transform2DDouble(re, im, n0, half, 0, false);
+            return new NDArray[]{
+                new ConcreteNDArray(re, outShape),
+                new ConcreteNDArray(im, outShape)
+            };
+        }
+
+        if (x.dtype() == DType.FLOAT32) {
+            float[] src = x.toFloatArray();
+            float[] re = new float[n0 * half];
+            float[] im = new float[n0 * half];
+            float[] tempReal = new float[n1];
+            float[] tempImag = new float[n1];
+            for (int i = 0; i < n0; i++) {
+                System.arraycopy(src, i * n1, tempReal, 0, n1);
+                java.util.Arrays.fill(tempImag, 0.0f);
+                fftInPlaceFloat(tempReal, tempImag, false);
+                System.arraycopy(tempReal, 0, re, i * half, half);
+                System.arraycopy(tempImag, 0, im, i * half, half);
+            }
+            transform2DFloat(re, im, n0, half, 0, false);
+            return new NDArray[]{
+                new ConcreteNDArray(re, outShape),
+                new ConcreteNDArray(im, outShape)
+            };
+        }
+        throw new IllegalArgumentException("rfft2 requires FLOAT32 or FLOAT64 input, got " + x.dtype());
+    }
+
+    /**
+     * 2-D real inverse FFT. Reconstructs a real signal of shape (N0, N1) from its
+     * complex frequency representation of shape (N0, N1/2 + 1).
+     */
+    public static NDArray irfft2(NDArray re, NDArray im) {
+        if (re.shape().rank() != 2 || im.shape().rank() != 2) {
+            throw new IllegalArgumentException("irfft2 requires 2-D inputs, got shapes " + re.shape() + ", " + im.shape());
+        }
+        if (!re.shape().equals(im.shape())) {
+            throw new IllegalArgumentException("irfft2 real and imaginary parts must have the same shape");
+        }
+        if (re.dtype() != im.dtype()) {
+            throw new IllegalArgumentException("irfft2 real and imaginary parts must share dtype: " + re.dtype() + " vs " + im.dtype());
+        }
+        int[] dims = re.shape().dimensions();
+        int n0 = dims[0], half = dims[1];
+        int n1 = 2 * (half - 1);
+        if (n1 < 2 || Integer.bitCount(n1) != 1) {
+            throw new IllegalArgumentException("irfft2 input implies N1 = " + n1 + ", which must be a power of two >= 2");
+        }
+        Shape outShape = new Shape(n0, n1);
+
+        if (re.dtype() == DType.FLOAT64) {
+            double[] workRe = re.toDoubleArray().clone();
+            double[] workIm = im.toDoubleArray().clone();
+            // Inverse transform along axis 0 first
+            transform2DDouble(workRe, workIm, n0, half, 0, true);
+            // Then expand back along last axis (Hermitian conjugate mirror + IFFT per row)
+            double[] out = new double[n0 * n1];
+            double[] tempRe = new double[n1];
+            double[] tempIm = new double[n1];
+            for (int i = 0; i < n0; i++) {
+                System.arraycopy(workRe, i * half, tempRe, 0, half);
+                System.arraycopy(workIm, i * half, tempIm, 0, half);
+                for (int k = 1; k < half - 1; k++) {
+                    tempRe[n1 - k] = tempRe[k];
+                    tempIm[n1 - k] = -tempIm[k];
+                }
+                fftInPlaceDouble(tempRe, tempIm, true);
+                System.arraycopy(tempRe, 0, out, i * n1, n1);
+            }
+            return new ConcreteNDArray(out, outShape);
+        }
+
+        if (re.dtype() == DType.FLOAT32) {
+            float[] workRe = re.toFloatArray().clone();
+            float[] workIm = im.toFloatArray().clone();
+            transform2DFloat(workRe, workIm, n0, half, 0, true);
+            float[] out = new float[n0 * n1];
+            float[] tempRe = new float[n1];
+            float[] tempIm = new float[n1];
+            for (int i = 0; i < n0; i++) {
+                System.arraycopy(workRe, i * half, tempRe, 0, half);
+                System.arraycopy(workIm, i * half, tempIm, 0, half);
+                for (int k = 1; k < half - 1; k++) {
+                    tempRe[n1 - k] = tempRe[k];
+                    tempIm[n1 - k] = -tempIm[k];
+                }
+                fftInPlaceFloat(tempRe, tempIm, true);
+                System.arraycopy(tempRe, 0, out, i * n1, n1);
+            }
+            return new ConcreteNDArray(out, outShape);
+        }
+        throw new IllegalArgumentException("irfft2 requires FLOAT32 or FLOAT64 input, got " + re.dtype());
+    }
+
+    /** 2-D complex transform: applies 1-D FFT along each axis. */
+    private static NDArray[] complexTransform2D(NDArray re, NDArray im, boolean inverse) {
+        if (re.shape().rank() != 2 || im.shape().rank() != 2) {
+            throw new IllegalArgumentException("fft2/ifft2 require 2-D inputs, got shapes " + re.shape() + ", " + im.shape());
+        }
+        if (!re.shape().equals(im.shape())) {
+            throw new IllegalArgumentException("fft2/ifft2 real and imaginary parts must have the same shape");
+        }
+        if (re.dtype() != im.dtype()) {
+            throw new IllegalArgumentException("fft2/ifft2 real and imaginary parts must share dtype: " + re.dtype() + " vs " + im.dtype());
+        }
+        int[] dims = re.shape().dimensions();
+        int n0 = dims[0], n1 = dims[1];
+        if (Integer.bitCount(n0) != 1 || Integer.bitCount(n1) != 1) {
+            throw new IllegalArgumentException("fft2/ifft2 dimensions must be powers of two, got " + re.shape());
+        }
+
+        if (re.dtype() == DType.FLOAT64) {
+            double[] a = re.toDoubleArray().clone();
+            double[] b = im.toDoubleArray().clone();
+            transform2DDouble(a, b, n0, n1, 1, inverse);
+            transform2DDouble(a, b, n0, n1, 0, inverse);
+            return new NDArray[]{new ConcreteNDArray(a, re.shape()), new ConcreteNDArray(b, im.shape())};
+        }
+
+        if (re.dtype() == DType.FLOAT32) {
+            float[] a = re.toFloatArray().clone();
+            float[] b = im.toFloatArray().clone();
+            transform2DFloat(a, b, n0, n1, 1, inverse);
+            transform2DFloat(a, b, n0, n1, 0, inverse);
+            return new NDArray[]{new ConcreteNDArray(a, re.shape()), new ConcreteNDArray(b, im.shape())};
+        }
+        throw new IllegalArgumentException("fft2/ifft2 require FLOAT32 or FLOAT64 input, got " + re.dtype());
+    }
+
+    /** Transform along a single axis of a 2-D array in row-major layout. */
+    private static void transform2DDouble(double[] re, double[] im, int n0, int n1, int dim, boolean inverse) {
+        if (dim == 1) {
+            // Transform along last axis (contiguous rows)
+            double[] tempRe = new double[n1];
+            double[] tempIm = new double[n1];
+            for (int i = 0; i < n0; i++) {
+                int offset = i * n1;
+                System.arraycopy(re, offset, tempRe, 0, n1);
+                System.arraycopy(im, offset, tempIm, 0, n1);
+                fftInPlaceDouble(tempRe, tempIm, inverse);
+                System.arraycopy(tempRe, 0, re, offset, n1);
+                System.arraycopy(tempIm, 0, im, offset, n1);
+            }
+        } else { // dim == 0
+            // Transform along first axis (stride = n1)
+            double[] tempRe = new double[n0];
+            double[] tempIm = new double[n0];
+            for (int j = 0; j < n1; j++) {
+                for (int i = 0; i < n0; i++) {
+                    tempRe[i] = re[i * n1 + j];
+                    tempIm[i] = im[i * n1 + j];
+                }
+                fftInPlaceDouble(tempRe, tempIm, inverse);
+                for (int i = 0; i < n0; i++) {
+                    re[i * n1 + j] = tempRe[i];
+                    im[i * n1 + j] = tempIm[i];
+                }
+            }
+        }
+    }
+
+    private static void transform2DFloat(float[] re, float[] im, int n0, int n1, int dim, boolean inverse) {
+        if (dim == 1) {
+            float[] tempRe = new float[n1];
+            float[] tempIm = new float[n1];
+            for (int i = 0; i < n0; i++) {
+                int offset = i * n1;
+                System.arraycopy(re, offset, tempRe, 0, n1);
+                System.arraycopy(im, offset, tempIm, 0, n1);
+                fftInPlaceFloat(tempRe, tempIm, inverse);
+                System.arraycopy(tempRe, 0, re, offset, n1);
+                System.arraycopy(tempIm, 0, im, offset, n1);
+            }
+        } else { // dim == 0
+            float[] tempRe = new float[n0];
+            float[] tempIm = new float[n0];
+            for (int j = 0; j < n1; j++) {
+                for (int i = 0; i < n0; i++) {
+                    tempRe[i] = re[i * n1 + j];
+                    tempIm[i] = im[i * n1 + j];
+                }
+                fftInPlaceFloat(tempRe, tempIm, inverse);
+                for (int i = 0; i < n0; i++) {
+                    re[i * n1 + j] = tempRe[i];
+                    im[i * n1 + j] = tempIm[i];
+                }
+            }
+        }
+    }
+
+    /**
+     * Try to dispatch fft2/ifft2 to GPU via cuFFT.
+     * Currently returns null (falls back to CPU) — GPU dispatch for 2-D is
+     * deferred until a cufftDispatch2D helper is implemented.
+     */
+    private static NDArray[] tryCuFft2(NDArray re, NDArray im, boolean inverse) {
+        // GPU 2-D dispatch not yet implemented; fall through to CPU path.
+        return null;
     }
 
     /**

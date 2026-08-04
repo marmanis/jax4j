@@ -11,6 +11,7 @@ import java.util.function.Function;
 
 /**
  * Port of JAX linear regression example.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class LinearRegression {
 

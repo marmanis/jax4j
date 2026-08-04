@@ -2,6 +2,7 @@ package com.marmanis.jax4j.core;
 
 /**
  * Supported data types in jax4j.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public enum DType {
     FLOAT32(Float.BYTES, "float32"),

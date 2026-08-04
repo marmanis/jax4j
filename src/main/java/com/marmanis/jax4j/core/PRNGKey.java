@@ -12,6 +12,7 @@ package com.marmanis.jax4j.core;
  * and never appears inside a {@code Jaxpr}; sampling always executes eagerly. See
  * {@link com.marmanis.jax4j.api.Random} for why this keeps autodiff/vmap/pmap
  * integration free (the resulting array is captured as an ordinary constant).
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public record PRNGKey(long state) {
 

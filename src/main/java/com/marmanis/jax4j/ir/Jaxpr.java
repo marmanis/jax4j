@@ -7,6 +7,7 @@ import java.util.stream.Collectors;
 
 /**
  * A JAX expression (Jaxpr) representing a traced computation.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public record Jaxpr(List<Var> inVars, List<Var> outVars, List<Equation> equations, Map<Integer, NDArray> consts) {
     @Override

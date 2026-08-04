@@ -27,6 +27,7 @@ import java.util.stream.IntStream;
  * otherwise; {@link #astype} is the explicit, principled way to convert.
  * FLOAT64 arithmetic always runs on the host (no TornadoVM kernel), unlike
  * FLOAT32 which dispatches to a device when explicitly placed.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class ConcreteNDArray implements NDArray {
     // Threshold above which elementwise and unary ops use parallel streams.
@@ -662,6 +663,204 @@ public class ConcreteNDArray implements NDArray {
     @Override public NDArray tanh() { return unary(Primitive.TANH, Math::tanh, NDArray::tanh); }
     @Override public NDArray relu() { return unary(Primitive.RELU, x -> Math.max(0.0, x), NDArray::relu); }
     @Override public NDArray sigmoid() { return unary(Primitive.SIGMOID, x -> 1.0 / (1.0 + Math.exp(-x)), NDArray::sigmoid); }
+
+    @Override
+    public NDArray reshape(Shape newShape) {
+        if (isTracing()) return toTraced().reshape(newShape);
+        if (newShape.size() != shape.size()) {
+            throw new IllegalArgumentException(
+                "reshape: size mismatch " + shape + " -> " + newShape + " (" + shape.size() + " vs " + newShape.size() + ")");
+        }
+        return switch (storage) {
+            case F32Storage s -> new ConcreteNDArray(s.data(), newShape, DType.FLOAT32, device);
+            case F64Storage s -> new ConcreteNDArray(s.data(), newShape, device);
+            case I32Storage s -> new ConcreteNDArray(s.data(), newShape, device);
+            case I64Storage s -> new ConcreteNDArray(s.data(), newShape, device);
+            case BoolStorage s -> new ConcreteNDArray(s.data(), newShape, device);
+        };
+    }
+
+    @Override
+    public NDArray transpose(int... axes) {
+        if (isTracing()) return toTraced().transpose(axes);
+        int rank = shape.rank();
+        if (axes.length != rank) {
+            throw new IllegalArgumentException(
+                "transpose: expected " + rank + " axes, got " + axes.length);
+        }
+        int[] dims = shape.dimensions();
+        int[] outDims = new int[rank];
+        for (int i = 0; i < rank; i++) outDims[i] = dims[axes[i]];
+        Shape outShape = new Shape(outDims);
+        int[] inStrides = new int[rank];
+        inStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--) inStrides[i] = inStrides[i + 1] * dims[i + 1];
+
+        int size = (int) shape.size();
+
+        if (dtype == DType.FLOAT32) {
+            float[] in = f32();
+            float[] out = new float[size];
+            for (int outFlat = 0; outFlat < size; outFlat++) {
+                int inFlat = transposeIndex(outFlat, outDims, dims, axes, inStrides, rank);
+                out[outFlat] = in[inFlat];
+            }
+            return new ConcreteNDArray(out, outShape, DType.FLOAT32, device);
+        }
+        if (dtype == DType.FLOAT64) {
+            double[] in = f64();
+            double[] out = new double[size];
+            for (int outFlat = 0; outFlat < size; outFlat++) {
+                int inFlat = transposeIndex(outFlat, outDims, dims, axes, inStrides, rank);
+                out[outFlat] = in[inFlat];
+            }
+            return new ConcreteNDArray(out, outShape, device);
+        }
+        if (dtype == DType.INT32) {
+            int[] in = i32();
+            int[] out = new int[size];
+            for (int outFlat = 0; outFlat < size; outFlat++) {
+                int inFlat = transposeIndex(outFlat, outDims, dims, axes, inStrides, rank);
+                out[outFlat] = in[inFlat];
+            }
+            return new ConcreteNDArray(out, outShape, device);
+        }
+        if (dtype == DType.INT64) {
+            long[] in = i64();
+            long[] out = new long[size];
+            for (int outFlat = 0; outFlat < size; outFlat++) {
+                int inFlat = transposeIndex(outFlat, outDims, dims, axes, inStrides, rank);
+                out[outFlat] = in[inFlat];
+            }
+            return new ConcreteNDArray(out, outShape, device);
+        }
+        if (dtype == DType.BOOL) {
+            boolean[] in = bl();
+            boolean[] out = new boolean[size];
+            for (int outFlat = 0; outFlat < size; outFlat++) {
+                int inFlat = transposeIndex(outFlat, outDims, dims, axes, inStrides, rank);
+                out[outFlat] = in[inFlat];
+            }
+            return new ConcreteNDArray(out, outShape, device);
+        }
+        throw new UnsupportedOperationException("transpose: unsupported dtype " + dtype);
+    }
+
+    /** Maps a flat output index to the corresponding flat input index under axis permutation. */
+    private static int transposeIndex(int outFlat, int[] outDims, int[] inDims, int[] axes, int[] inStrides, int rank) {
+        // Decompose outFlat into outCoords
+        int rem = outFlat;
+        int[] outCoords = new int[rank];
+        for (int i = rank - 1; i >= 0; i--) {
+            outCoords[i] = rem % outDims[i];
+            rem /= outDims[i];
+        }
+        // inCoords[axes[i]] = outCoords[i]
+        int inFlat = 0;
+        for (int i = 0; i < rank; i++) {
+            inFlat += outCoords[i] * inStrides[axes[i]];
+        }
+        return inFlat;
+    }
+
+    @Override
+    public NDArray pad(int[][] padding) {
+        if (isTracing()) return toTraced().pad(padding);
+        int rank = shape.rank();
+        if (padding.length != rank) {
+            throw new IllegalArgumentException(
+                "pad: padding must have " + rank + " rows, got " + padding.length);
+        }
+        int[] inDims = shape.dimensions();
+        int[] outDims = new int[rank];
+        for (int i = 0; i < rank; i++) {
+            outDims[i] = inDims[i] + padding[i][0] + padding[i][1];
+        }
+        Shape outShape = new Shape(outDims);
+        int size = (int) outShape.size();
+
+        // Compute strides for output layout
+        int[] outStrides = new int[rank];
+        outStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--) outStrides[i] = outStrides[i + 1] * outDims[i + 1];
+        int[] inStrides = new int[rank];
+        inStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--) inStrides[i] = inStrides[i + 1] * inDims[i + 1];
+
+        if (dtype == DType.FLOAT32) {
+            float[] in = f32();
+            float[] out = new float[size]; // zero-initialised
+            padCopy(in, out, inDims, outDims, inStrides, outStrides, padding, rank);
+            return new ConcreteNDArray(out, outShape, DType.FLOAT32, device);
+        }
+        if (dtype == DType.FLOAT64) {
+            double[] in = f64();
+            double[] out = new double[size];
+            padCopyD(in, out, inDims, outDims, inStrides, outStrides, padding, rank);
+            return new ConcreteNDArray(out, outShape, device);
+        }
+        if (dtype == DType.INT32) {
+            int[] in = i32();
+            int[] out = new int[size];
+            padCopyI(in, out, inDims, outDims, inStrides, outStrides, padding, rank);
+            return new ConcreteNDArray(out, outShape, device);
+        }
+        throw new UnsupportedOperationException("pad: unsupported dtype " + dtype);
+    }
+
+    private static void padCopy(float[] in, float[] out,
+                                 int[] inDims, int[] outDims,
+                                 int[] inStrides, int[] outStrides,
+                                 int[][] padding, int rank) {
+        int inSize = 1;
+        for (int d : inDims) inSize *= d;
+        for (int inFlat = 0; inFlat < inSize; inFlat++) {
+            int rem = inFlat;
+            int outFlat = 0;
+            for (int i = rank - 1; i >= 0; i--) {
+                int coord = rem % inDims[i];
+                rem /= inDims[i];
+                outFlat += (coord + padding[i][0]) * outStrides[i];
+            }
+            out[outFlat] = in[inFlat];
+        }
+    }
+
+    private static void padCopyD(double[] in, double[] out,
+                                   int[] inDims, int[] outDims,
+                                   int[] inStrides, int[] outStrides,
+                                   int[][] padding, int rank) {
+        int inSize = 1;
+        for (int d : inDims) inSize *= d;
+        for (int inFlat = 0; inFlat < inSize; inFlat++) {
+            int rem = inFlat;
+            int outFlat = 0;
+            for (int i = rank - 1; i >= 0; i--) {
+                int coord = rem % inDims[i];
+                rem /= inDims[i];
+                outFlat += (coord + padding[i][0]) * outStrides[i];
+            }
+            out[outFlat] = in[inFlat];
+        }
+    }
+
+    private static void padCopyI(int[] in, int[] out,
+                                  int[] inDims, int[] outDims,
+                                  int[] inStrides, int[] outStrides,
+                                  int[][] padding, int rank) {
+        int inSize = 1;
+        for (int d : inDims) inSize *= d;
+        for (int inFlat = 0; inFlat < inSize; inFlat++) {
+            int rem = inFlat;
+            int outFlat = 0;
+            for (int i = rank - 1; i >= 0; i--) {
+                int coord = rem % inDims[i];
+                rem /= inDims[i];
+                outFlat += (coord + padding[i][0]) * outStrides[i];
+            }
+            out[outFlat] = in[inFlat];
+        }
+    }
 
     @Override
     public NDArray astype(DType target) {

@@ -28,6 +28,7 @@ import java.util.function.Function;
  *
  * <p>Training data is the real MNIST dataset, fetched and cached by
  * {@link DownloadManager#mnist(boolean)}.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class MNISTFromScratch {
 

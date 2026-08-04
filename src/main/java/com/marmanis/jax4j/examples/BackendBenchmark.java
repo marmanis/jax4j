@@ -35,6 +35,7 @@ import java.util.stream.IntStream;
  * the {@code tornado} Maven profile — activate via
  * {@code mvn -Ptornado exec:exec ...}). Without that, TornadoVM devices
  * won't be discovered and only the CPU-1 / CPU-N columns will be filled.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class BackendBenchmark {
 

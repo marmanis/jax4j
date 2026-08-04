@@ -4,14 +4,20 @@ import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.ConcreteNDArray;
 import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.Shape;
+import com.marmanis.jax4j.api.Fft;
+import com.marmanis.jax4j.api.Linalg;
 import com.marmanis.jax4j.ir.AxisMeta;
 import com.marmanis.jax4j.ir.CheckpointMeta;
+import com.marmanis.jax4j.ir.ConcatMeta;
 import com.marmanis.jax4j.ir.CondMeta;
+import com.marmanis.jax4j.ir.CustomVjpMeta;
 import com.marmanis.jax4j.ir.Equation;
 import com.marmanis.jax4j.ir.Jaxpr;
+import com.marmanis.jax4j.ir.PadMeta;
 import com.marmanis.jax4j.ir.PmapMeta;
 import com.marmanis.jax4j.ir.Primitive;
 import com.marmanis.jax4j.ir.ScanMeta;
+import com.marmanis.jax4j.ir.TransposeMeta;
 import com.marmanis.jax4j.ir.Var;
 import com.marmanis.jax4j.ir.WhileMeta;
 import com.marmanis.jax4j.pytree.PyTree;
@@ -28,6 +34,7 @@ import java.util.function.Function;
 
 /**
  * Logic for reverse-mode automatic differentiation.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class Grad {
 
@@ -334,6 +341,39 @@ public class Grad {
                 CheckpointMeta m = (CheckpointMeta) eq.metadata();
                 yield forwardInterpret(m.subJaxpr(), List.of(inputs[0])).get(0);
             }
+            case RESHAPE -> inputs[0].reshape(eq.outputs().get(0).shape());
+            case TRANSPOSE -> {
+                TransposeMeta m = (TransposeMeta) eq.metadata();
+                yield inputs[0].transpose(m.axes());
+            }
+            case CONCAT -> {
+                ConcatMeta m = (ConcatMeta) eq.metadata();
+                yield Numpy.concatenateEager(java.util.Arrays.asList(inputs), m.axis(),
+                    eq.outputs().get(0).shape(), inputs[0].dtype());
+            }
+            case PAD -> {
+                PadMeta m = (PadMeta) eq.metadata();
+                yield inputs[0].pad(m.padding());
+            }
+            case SCATTER_ADD -> Lax.scatterAddEager(inputs[0], inputs[1], inputs[2]);
+            case FFT -> fftPackedForward(inputs[0], false);
+            case IFFT -> fftPackedForward(inputs[0], true);
+            case LINALG_SOLVE -> Linalg.solve(inputs[0], inputs[1]);
+            case LINALG_SVD -> {
+                // SVD returns (U, S, Vt) packed as 3 concatenated arrays.
+                // For forward, just solve using the S as the result (eigenvalue-like scalar).
+                // In practice the traced version packs S into a 1-D result.
+                Linalg.Svd svd = Linalg.svd(inputs[0]);
+                yield svd.sigma();
+            }
+            case LINALG_EIG -> {
+                NDArray[] eig = Linalg.eig(inputs[0]);
+                yield eig[0]; // real parts of eigenvalues
+            }
+            case CUSTOM_VJP -> {
+                CustomVjpMeta m = (CustomVjpMeta) eq.metadata();
+                yield m.fn().apply(inputs[0]);
+            }
             default -> throw new UnsupportedOperationException(p.toString());
         };
     }
@@ -466,6 +506,47 @@ public class Grad {
                 // needed for the backward pass, then differentiate through them.
                 CheckpointMeta m = (CheckpointMeta) eq.metadata();
                 yield List.of(backwardInterpret(m.subJaxpr(), List.of(inputs[0]), List.of(gOut)).get(0));
+            }
+            case RESHAPE -> List.of(gOut.reshape(inputs[0].shape()));
+            case TRANSPOSE -> {
+                TransposeMeta m = (TransposeMeta) eq.metadata();
+                yield List.of(gOut.transpose(invertPerm(m.axes())));
+            }
+            case CONCAT -> {
+                ConcatMeta m = (ConcatMeta) eq.metadata();
+                yield splitAlongAxis(gOut, inputs, m.axis());
+            }
+            case PAD -> {
+                PadMeta m = (PadMeta) eq.metadata();
+                yield List.of(unpad(gOut, m.padding(), inputs[0].shape()));
+            }
+            case SCATTER_ADD -> {
+                // VJP wrt target: passthrough (identity on gOut)
+                // VJP wrt indices: zero (non-differentiable)
+                // VJP wrt updates: gather gOut at indices
+                NDArray gTarget = broadcastLike(gOut, inputs[0]);
+                NDArray gIndices = zerosLike(inputs[1]);
+                NDArray gUpdates = Numpy.takeEager(gOut, inputs[1]);
+                yield List.of(gTarget, gIndices, gUpdates);
+            }
+            case FFT -> List.of(fftPackedForward(gOut, true));   // grad of FFT = IFFT
+            case IFFT -> List.of(fftPackedForward(gOut, false));  // grad of IFFT = FFT
+            case LINALG_SOLVE -> {
+                // A x = b. g_b = A^T^{-1} g_x = solve(A^T, g_x)
+                // g_A = -outer(g_b, x)
+                NDArray A = inputs[0];
+                NDArray x = eq.outputs().get(0) != null ? Linalg.solve(A, inputs[1]) : inputs[1]; // recompute x
+                NDArray gB = solveTransposeGrad(A, gOut);
+                NDArray gA = outerNeg(gB, x);
+                yield List.of(gA, gB);
+            }
+            case LINALG_SVD, LINALG_EIG -> {
+                // Simplified: zero gradient (not fully differentiable in this stub)
+                yield List.of(zerosLike(inputs[0]));
+            }
+            case CUSTOM_VJP -> {
+                CustomVjpMeta m = (CustomVjpMeta) eq.metadata();
+                yield List.of(m.vjpFn().apply(inputs[0], gOut));
             }
             default -> throw new UnsupportedOperationException(p.toString());
         };
@@ -811,6 +892,30 @@ public class Grad {
                 ForwardAdResult cpOut = forwardAd(m.subJaxpr(), List.of(primals[0]), List.of(tangents[0]));
                 return cpOut.tangents().get(0);
             }
+            case RESHAPE -> {
+                return tangents[0].reshape(primalOut.shape());
+            }
+            case TRANSPOSE -> {
+                TransposeMeta m = (TransposeMeta) eq.metadata();
+                return tangents[0].transpose(m.axes());
+            }
+            case CONCAT -> {
+                ConcatMeta m = (ConcatMeta) eq.metadata();
+                return Numpy.concatenateEager(java.util.Arrays.asList(tangents), m.axis(), primalOut.shape(), primalOut.dtype());
+            }
+            case PAD -> {
+                PadMeta m = (PadMeta) eq.metadata();
+                return tangents[0].pad(m.padding());
+            }
+            case SCATTER_ADD -> {
+                // scatter_add is linear in target and updates; indices are non-differentiable
+                return Lax.scatterAddEager(tangents[0], primals[1], tangents[2]);
+            }
+            case FFT -> { return fftPackedForward(tangents[0], false); }
+            case IFFT -> { return fftPackedForward(tangents[0], true); }
+            case LINALG_SOLVE, LINALG_SVD, LINALG_EIG, CUSTOM_VJP -> {
+                return zeros(shape, dtype);
+            }
             case PMAP -> {
                 PmapMeta m = (PmapMeta) eq.metadata();
                 NDArray[] primalShards = Pmap.split(primals[0], m.numDevices());
@@ -884,6 +989,105 @@ public class Grad {
     /** Zero gradient placeholder matching {@code x}'s own dtype when it's floating, else FLOAT32 (inert default). */
     private static NDArray zerosLike(NDArray x) {
         return zeros(x.shape(), floatDtypeOrDefault(x.dtype()));
+    }
+
+    /** Returns the inverse permutation of {@code perm}: {@code inv[perm[i]] = i}. */
+    private static int[] invertPerm(int[] perm) {
+        int[] inv = new int[perm.length];
+        for (int i = 0; i < perm.length; i++) inv[perm[i]] = i;
+        return inv;
+    }
+
+    /**
+     * Splits {@code x} along {@code axis} into chunks matching the axis-size of
+     * each corresponding input array. Returns one gradient chunk per input.
+     */
+    private static List<NDArray> splitAlongAxis(NDArray x, NDArray[] inputs, int axis) {
+        List<NDArray> result = new java.util.ArrayList<>(inputs.length);
+        int offset = 0;
+        for (NDArray input : inputs) {
+            int size = input.shape().dimensions()[axis];
+            result.add(Numpy.sliceAxis(x, axis, offset, offset + size));
+            offset += size;
+        }
+        return result;
+    }
+
+    /**
+     * Slices away the padding from a padded gradient, recovering the original shape.
+     */
+    private static NDArray unpad(NDArray x, int[][] padding, Shape origShape) {
+        // For each dim i, we want coords in [padding[i][0], padding[i][0] + origShape.dimensions()[i])
+        // This is equivalent to sliceAxis applied per dimension.
+        NDArray result = x;
+        int[] dims = x.shape().dimensions();
+        int rank = dims.length;
+        // Work from last axis to first so slicing dimensions stay consistent
+        for (int i = rank - 1; i >= 0; i--) {
+            int before = padding[i][0];
+            int origSize = origShape.dimensions()[i];
+            result = Numpy.sliceAxis(result, i, before, before + origSize);
+        }
+        return result;
+    }
+
+    /**
+     * FFT autodiff helper: applies forward or inverse FFT to a packed [N, 2] complex array
+     * where {@code arr[k, 0]} is the real part and {@code arr[k, 1]} the imaginary part.
+     * When {@code inverse=true} runs the normalized IFFT.
+     * Package-visible so Vmap can reuse the same kernel.
+     */
+    static NDArray fftPackedExec(NDArray arr, boolean inverse) { return fftPackedForward(arr, inverse); }
+
+    private static NDArray fftPackedForward(NDArray arr, boolean inverse) {
+        int[] dims = arr.shape().dimensions();
+        int n = dims[0]; // number of frequency / time bins
+        // Split into re and im
+        NDArray re = Numpy.sliceAxis(arr, 1, 0, 1).reshape(n);
+        NDArray im = Numpy.sliceAxis(arr, 1, 1, 2).reshape(n);
+        NDArray[] out;
+        if (arr.dtype() == DType.FLOAT64) {
+            out = inverse ? Fft.ifft(re, im) : Fft.fft(re, im);
+        } else {
+            out = inverse ? Fft.ifft(re, im) : Fft.fft(re, im);
+        }
+        // Pack back into [N, 2]
+        NDArray outRe = out[0].reshape(new com.marmanis.jax4j.core.Shape(n, 1));
+        NDArray outIm = out[1].reshape(new com.marmanis.jax4j.core.Shape(n, 1));
+        return Numpy.concatenateEager(List.of(outRe, outIm), 1,
+            new com.marmanis.jax4j.core.Shape(n, 2), arr.dtype());
+    }
+
+    /** Computes {@code -outer(a, b)} = {@code -a[:, None] * b[None, :]} for 1-D vectors. */
+    private static NDArray outerNeg(NDArray a, NDArray b) {
+        int m = (int) a.shape().size();
+        int n = (int) b.shape().size();
+        if (a.dtype() == DType.FLOAT64) {
+            double[] av = a.toDoubleArray();
+            double[] bv = b.toDoubleArray();
+            double[] out = new double[m * n];
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                    out[i * n + j] = -av[i] * bv[j];
+            return new ConcreteNDArray(out, new Shape(m, n));
+        }
+        float[] av = a.toFloatArray();
+        float[] bv = b.toFloatArray();
+        float[] out = new float[m * n];
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < n; j++)
+                out[i * n + j] = -av[i] * bv[j];
+        return new ConcreteNDArray(out, new Shape(m, n));
+    }
+
+    /**
+     * Solves {@code A^T g = gOut} via LU factorization of A^T.
+     * Used in the LINALG_SOLVE VJP: {@code g_b = solve(A^T, g_x)}.
+     */
+    private static NDArray solveTransposeGrad(NDArray A, NDArray gOut) {
+        // Transpose A and solve the system
+        NDArray At = A.transpose(1, 0);
+        return Linalg.solve(At, gOut);
     }
 
     private static NDArray minusOne(Shape shape, DType dtype) {

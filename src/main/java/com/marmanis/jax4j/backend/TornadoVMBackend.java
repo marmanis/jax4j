@@ -21,33 +21,81 @@ import uk.ac.manchester.tornado.api.enums.DataTransferMode;
  * <p>Only the elementwise ops have kernels here (ADD/SUB/MUL/DIV/EXP/LOG/SIN/COS).
  * DOT/SUM/MEAN need TornadoVM's reduction-specific annotations and are left as a
  * follow-up; {@code ConcreteNDArray} never routes them through this backend.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class TornadoVMBackend implements ExecutionBackend {
     private static final Logger log = LoggerFactory.getLogger(TornadoVMBackend.class);
     public static final TornadoVMBackend INSTANCE = new TornadoVMBackend();
 
+    // ----------------------------------------------------------------
+    // GAP-3: TaskGraph plan cache
+    //
+    // Key: (primitive, array-size, isF64).
+    // Cached value: the pre-built plan together with its bound float[]
+    // buffers so we can copy fresh input data in before re-executing.
+    // The TornadoVM transferToDevice(EVERY_EXECUTION, ...) mode reads
+    // the array reference it was given at graph-construction time on
+    // every execute() call, so writing new values into those arrays and
+    // calling execute() again is the correct way to reuse a plan.
+    // ----------------------------------------------------------------
+
+    private record CacheKey(Primitive primitive, int size, boolean isF64) {}
+
+    private record CachedPlan(TornadoExecutionPlan plan,
+                               float[] inA, float[] inB, float[] outF,
+                               double[] inAd, double[] inBd, double[] outD) {}
+
+    private static final java.util.concurrent.ConcurrentHashMap<CacheKey, CachedPlan> PLAN_CACHE =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
     @Override
     public float[] binary(Primitive primitive, float[] a, float[] b, Device device) {
+        CacheKey key = new CacheKey(primitive, a.length, false);
+        CachedPlan cached = PLAN_CACHE.get(key);
+        if (cached != null) {
+            // Cache hit: update bound buffers and re-execute.
+            // The plan's TaskGraph was built with EVERY_EXECUTION transfer mode,
+            // so writing into the same float[] arrays and calling execute() again
+            // uploads the fresh data automatically.
+            try {
+                System.arraycopy(a, 0, cached.inA(), 0, a.length);
+                System.arraycopy(b, 0, cached.inB(), 0, b.length);
+                cached.plan().execute();
+                float[] out = new float[a.length];
+                System.arraycopy(cached.outF(), 0, out, 0, a.length);
+                return out;
+            } catch (Throwable t) {
+                log.warn("TornadoVM cached execution failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
+                return HostBackend.INSTANCE.binary(primitive, a, b, device);
+            }
+        }
+
+        // Cache miss: build, cache, execute.
+        float[] inA = a.clone();
+        float[] inB = b.clone();
         float[] out = new float[a.length];
         try {
-            TaskGraph tg = new TaskGraph("jax4j_" + primitive)
-                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a, b);
+            TaskGraph tg = new TaskGraph("jax4j_" + primitive + "_" + a.length)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, inA, inB);
             tg = switch (primitive) {
-                case ADD -> tg.task("k", TornadoVMBackend::vectorAdd, a, b, out);
-                case SUB -> tg.task("k", TornadoVMBackend::vectorSub, a, b, out);
-                case MUL -> tg.task("k", TornadoVMBackend::vectorMul, a, b, out);
-                case DIV -> tg.task("k", TornadoVMBackend::vectorDiv, a, b, out);
-                case MAX -> tg.task("k", TornadoVMBackend::vectorMax, a, b, out);
-                case MIN -> tg.task("k", TornadoVMBackend::vectorMin, a, b, out);
+                case ADD -> tg.task("k", TornadoVMBackend::vectorAdd, inA, inB, out);
+                case SUB -> tg.task("k", TornadoVMBackend::vectorSub, inA, inB, out);
+                case MUL -> tg.task("k", TornadoVMBackend::vectorMul, inA, inB, out);
+                case DIV -> tg.task("k", TornadoVMBackend::vectorDiv, inA, inB, out);
+                case MAX -> tg.task("k", TornadoVMBackend::vectorMax, inA, inB, out);
+                case MIN -> tg.task("k", TornadoVMBackend::vectorMin, inA, inB, out);
                 default -> throw new UnsupportedOperationException("No TornadoVM kernel for " + primitive);
             };
             tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
 
             ImmutableTaskGraph itg = tg.snapshot();
-            try (TornadoExecutionPlan plan = configuredPlan(itg, device)) {
-                plan.execute();
-            }
-            return out;
+            TornadoExecutionPlan plan = configuredPlan(itg, device);
+            plan.execute();
+            // Store in cache (don't close the plan — it must stay alive for reuse).
+            PLAN_CACHE.putIfAbsent(key, new CachedPlan(plan, inA, inB, out, null, null, null));
+            float[] result = new float[a.length];
+            System.arraycopy(out, 0, result, 0, a.length);
+            return result;
         } catch (Throwable t) {
             log.warn("TornadoVM execution failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
             return HostBackend.INSTANCE.binary(primitive, a, b, device);

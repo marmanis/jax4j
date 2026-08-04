@@ -8,6 +8,7 @@ package com.marmanis.jax4j.api;
  *
  * <p>Outside a pmap execution this is {@code null}; collective ops treat
  * {@code null} as "identity / not in pmap" and pass through without blocking.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public final class PmapContext {
     private static final ThreadLocal<PmapContext> CURRENT = new ThreadLocal<>();

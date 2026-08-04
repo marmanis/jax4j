@@ -5,14 +5,18 @@ import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.Shape;
 import com.marmanis.jax4j.ir.AxisMeta;
+import com.marmanis.jax4j.ir.ConcatMeta;
 import com.marmanis.jax4j.ir.Equation;
+import com.marmanis.jax4j.ir.PadMeta;
 import com.marmanis.jax4j.ir.Primitive;
+import com.marmanis.jax4j.ir.TransposeMeta;
 import com.marmanis.jax4j.ir.Var;
 
 import java.util.List;
 
 /**
  * An NDArray that records its operations into a Tracer instead of performing them eagerly.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class TracedNDArray implements NDArray {
     private final Var var;
@@ -141,6 +145,29 @@ public class TracedNDArray implements NDArray {
     public NDArray argmin(int axis) {
         int norm = shape().normalizeAxis(axis);
         return applyPrimitive(Primitive.ARGMIN, List.of(this), shape().reduceAxis(norm, false), DType.INT32, new AxisMeta(norm, false));
+    }
+
+    @Override
+    public NDArray reshape(Shape newShape) {
+        return applyPrimitive(Primitive.RESHAPE, List.of(this), newShape);
+    }
+
+    @Override
+    public NDArray transpose(int... axes) {
+        int[] dims = shape().dimensions();
+        int[] outDims = new int[dims.length];
+        for (int i = 0; i < dims.length; i++) outDims[i] = dims[axes[i]];
+        return applyPrimitive(Primitive.TRANSPOSE, List.of(this), new Shape(outDims), new TransposeMeta(axes));
+    }
+
+    @Override
+    public NDArray pad(int[][] padding) {
+        int[] dims = shape().dimensions();
+        int[] outDims = new int[dims.length];
+        for (int i = 0; i < dims.length; i++) {
+            outDims[i] = dims[i] + padding[i][0] + padding[i][1];
+        }
+        return applyPrimitive(Primitive.PAD, List.of(this), new Shape(outDims), new PadMeta(padding));
     }
 
     @Override

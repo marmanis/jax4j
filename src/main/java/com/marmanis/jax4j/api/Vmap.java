@@ -3,12 +3,20 @@ package com.marmanis.jax4j.api;
 import com.marmanis.jax4j.core.ConcreteNDArray;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.Shape;
+import com.marmanis.jax4j.api.Grad;
+import com.marmanis.jax4j.api.Lax;
+import com.marmanis.jax4j.api.Linalg;
+import com.marmanis.jax4j.api.Numpy;
 import com.marmanis.jax4j.ir.AxisMeta;
 import com.marmanis.jax4j.ir.CheckpointMeta;
+import com.marmanis.jax4j.ir.ConcatMeta;
+import com.marmanis.jax4j.ir.CustomVjpMeta;
 import com.marmanis.jax4j.ir.Equation;
 import com.marmanis.jax4j.ir.Jaxpr;
+import com.marmanis.jax4j.ir.PadMeta;
 import com.marmanis.jax4j.ir.PmapMeta;
 import com.marmanis.jax4j.ir.Primitive;
+import com.marmanis.jax4j.ir.TransposeMeta;
 import com.marmanis.jax4j.ir.Var;
 
 import java.util.ArrayList;
@@ -35,6 +43,7 @@ import java.util.function.Function;
  * <p>Unlike {@code grad}, this implementation only supports {@code in_axes=0,
  * out_axes=0} (the most common case) and executes eagerly: it does not compose
  * with further tracing (e.g. {@code grad(vmap(f))}).
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class Vmap {
 
@@ -239,6 +248,72 @@ public class Vmap {
                 }
                 yield ScanUtil.stackLeading(batchResults);
             }
+            case RESHAPE -> {
+                // RESHAPE has no metadata; the target shape is derived from the input.
+                // Under vmap, the batched input has a leading batch dim; we must keep it.
+                // The logical per-example target shape is the output shape with leading dim removed.
+                // Since we can't recover the original outShape here (no metadata), we just
+                // reshape to preserve batch size and flatten/unflatten the rest.
+                // Concrete: if in=[B, *in_ex] and target=[*out_ex] then batched target=[B, *out_ex].
+                // The existing applyBatchingRule doesn't have access to eq.outputs() here.
+                // Simple heuristic: batched reshape = reshape keeping leading dim.
+                if (!batched[0]) {
+                    // Not batched — use input shape as-is (shouldn't happen in normal vmap flow)
+                    yield inputs[0];
+                }
+                // The batch dim is inputs[0].shape().dimensions()[0]; inner size is unchanged.
+                int b = inputs[0].shape().dimensions()[0];
+                long innerSize = inputs[0].shape().size() / b;
+                yield inputs[0].reshape(new Shape(b, (int) innerSize));
+            }
+            case TRANSPOSE -> {
+                TransposeMeta m = (TransposeMeta) metadata;
+                if (!batched[0]) yield inputs[0].transpose(m.axes());
+                // When batched, the leading dim is batch — shift all axes by 1.
+                int[] axes = m.axes();
+                int[] baxes = new int[axes.length + 1];
+                baxes[0] = 0; // batch axis stays at 0
+                for (int i = 0; i < axes.length; i++) baxes[i + 1] = axes[i] + 1;
+                yield inputs[0].transpose(baxes);
+            }
+            case CONCAT -> {
+                ConcatMeta m = (ConcatMeta) metadata;
+                int axis = batched[0] ? m.axis() + 1 : m.axis();
+                yield Numpy.concatenateEager(java.util.Arrays.asList(inputs), axis,
+                    computeConcatOutputShape(inputs, axis), inputs[0].dtype());
+            }
+            case PAD -> {
+                PadMeta m = (PadMeta) metadata;
+                if (!batched[0]) yield inputs[0].pad(m.padding());
+                // Shift padding: no padding on batch dim, existing padding on inner dims
+                int[][] batchedPad = new int[m.padding().length + 1][2];
+                batchedPad[0] = new int[]{0, 0};
+                System.arraycopy(m.padding(), 0, batchedPad, 1, m.padding().length);
+                yield inputs[0].pad(batchedPad);
+            }
+            case SCATTER_ADD -> {
+                yield Lax.scatterAddEager(inputs[0], inputs[1], inputs[2]);
+            }
+            case FFT -> {
+                // Apply FFT to each batch element (the packed [N,2] representation)
+                yield applyPerBatch(inputs[0], batchSize, x -> Grad.fftPackedExec(x, false));
+            }
+            case IFFT -> {
+                yield applyPerBatch(inputs[0], batchSize, x -> Grad.fftPackedExec(x, true));
+            }
+            case LINALG_SOLVE -> {
+                yield Linalg.solve(inputs[0], inputs[1]);
+            }
+            case LINALG_SVD -> {
+                yield Linalg.svd(inputs[0]).sigma();
+            }
+            case LINALG_EIG -> {
+                yield Linalg.eig(inputs[0])[0];
+            }
+            case CUSTOM_VJP -> {
+                CustomVjpMeta m = (CustomVjpMeta) metadata;
+                yield m.fn().apply(inputs[0]);
+            }
             default -> throw new UnsupportedOperationException(
                 "vmap has no batching rule for primitive: " + p);
         };
@@ -294,6 +369,24 @@ public class Vmap {
             }
         }
         return new ConcreteNDArray(out, new Shape(batchSize, M, N));
+    }
+
+    private static Shape computeConcatOutputShape(NDArray[] inputs, int axis) {
+        int[] outDims = inputs[0].shape().dimensions().clone();
+        for (int i = 1; i < inputs.length; i++) outDims[axis] += inputs[i].shape().dimensions()[axis];
+        return new Shape(outDims);
+    }
+
+    /** Applies a per-example function to each slice along the leading batch dimension. */
+    private static NDArray applyPerBatch(NDArray batched, int batchSize, java.util.function.Function<NDArray, NDArray> fn) {
+        Shape batchedShape = batched.shape();
+        Shape exShape = new Shape(Arrays.copyOfRange(batchedShape.dimensions(), 1, batchedShape.rank()));
+        List<NDArray> results = new java.util.ArrayList<>(batchSize);
+        for (int b = 0; b < batchSize; b++) {
+            NDArray example = ScanUtil.sliceLeading(batched, b, exShape);
+            results.add(fn.apply(example));
+        }
+        return ScanUtil.stackLeading(results);
     }
 
     private static NDArray broadcastToBatch(NDArray value, int batchSize) {

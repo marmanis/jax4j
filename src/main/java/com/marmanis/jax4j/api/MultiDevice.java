@@ -20,6 +20,7 @@ import java.util.function.Function;
  * Each shard is placed on its device via {@link NDArray#to(Device)} before
  * {@code fn} runs, so device-checked ops inside {@code fn} (see
  * {@code ConcreteNDArray#elementwise}) dispatch to that device correctly.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public final class MultiDevice {
     private MultiDevice() {}

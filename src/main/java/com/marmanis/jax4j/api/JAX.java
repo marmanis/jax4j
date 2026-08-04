@@ -4,6 +4,7 @@ import com.marmanis.jax4j.core.Device;
 import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.ir.CheckpointMeta;
+import com.marmanis.jax4j.ir.CustomVjpMeta;
 import com.marmanis.jax4j.ir.Equation;
 import com.marmanis.jax4j.ir.Jaxpr;
 import com.marmanis.jax4j.ir.PmapMeta;
@@ -21,6 +22,7 @@ import java.util.function.Function;
 
 /**
  * Main entry point for JAX transformations.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class JAX {
 
@@ -388,5 +390,53 @@ public class JAX {
             Tracer.abort();
             throw e;
         }
+    }
+
+    /**
+     * Wraps {@code fn} with a custom VJP rule, mirroring {@code jax.custom_vjp}.
+     * When the returned function is called:
+     * <ul>
+     *   <li>During a forward pass, it evaluates {@code fn(x)}.</li>
+     *   <li>During a backward pass, the gradient is computed as
+     *       {@code vjpFn(x, g)} instead of the automatic derivative of
+     *       {@code fn}.</li>
+     * </ul>
+     *
+     * @param fn      the forward function: {@code output = fn(input)}
+     * @param vjpFn   the VJP function: {@code grad_input = vjpFn(input, grad_output)}
+     * @return a wrapped function that participates in autodiff via the custom VJP
+     */
+    public static Function<NDArray, NDArray> customVjp(
+            Function<NDArray, NDArray> fn,
+            BiFunction<NDArray, NDArray, NDArray> vjpFn) {
+        return (input) -> {
+            if (Tracer.current() == null) {
+                // Eager: just run fn
+                return fn.apply(input);
+            }
+            // Tracing: emit CUSTOM_VJP primitive
+            Tracer tracer = Tracer.current();
+            Var inVar;
+            if (input instanceof TracedNDArray t) {
+                inVar = t.getVar();
+            } else {
+                inVar = tracer.nextConstant(input);
+            }
+            // Compute output shape by running fn eagerly on a dummy (not possible in trace),
+            // so we run fn on the concrete value if available, or use a same-shape placeholder.
+            NDArray probeResult = fn.apply(input instanceof TracedNDArray ? input : input);
+            com.marmanis.jax4j.core.Shape outShape;
+            if (probeResult instanceof TracedNDArray t) {
+                outShape = t.shape();
+            } else {
+                outShape = probeResult.shape();
+            }
+            Var outVar = tracer.nextVar(outShape, input.dtype());
+            tracer.addEquation(new Equation(
+                List.of(inVar), List.of(outVar),
+                Primitive.CUSTOM_VJP,
+                new CustomVjpMeta(fn, vjpFn)));
+            return new TracedNDArray(outVar);
+        };
     }
 }

@@ -7,6 +7,7 @@ import com.marmanis.jax4j.core.Device;
  * every example accepts. Defaults to {@code ptx} (the discrete NVIDIA GPU in
  * this environment); pass {@code --backend=opencl} to instead run on the
  * multi-core CPU via TornadoVM's OpenCL/POCL backend.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 final class ExampleBackend {
     private ExampleBackend() {}

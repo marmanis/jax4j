@@ -50,6 +50,7 @@ import static com.marmanis.jax4j.api.ScanUtil.stackLeading;
  * is itself data-dependent, so there is no fixed-size backward pass to run.
  * Use {@code scan} or {@code foriLoop} (both have a trace-time-known number
  * of steps) when gradients through repeated application are needed.
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public final class Lax {
     private Lax() {}
@@ -230,5 +231,60 @@ public final class Lax {
             Tracer.abort();
             throw e;
         }
+    }
+
+    /**
+     * Scatter-add: for each {@code i} in {@code 0..k-1}, adds
+     * {@code updates[i]} into {@code target[indices[i]]} (first-axis indexing).
+     * {@code target} is a floating array of shape {@code [n, *rest]};
+     * {@code indices} is INT32 of shape {@code [k]}; {@code updates} has
+     * shape {@code [k, *rest]}. The return has the same shape as {@code target}.
+     *
+     * <p>Differentiable w.r.t. {@code target} (passthrough) and
+     * {@code updates} (gather backward).
+     */
+    public static NDArray scatterAdd(NDArray target, NDArray indices, NDArray updates) {
+        if (isTracing()) {
+            Tracer tracer = Tracer.current();
+            Var targetVar = toVar(target);
+            Var indicesVar = toVar(indices);
+            Var updatesVar = toVar(updates);
+            Var outVar = tracer.nextVar(target.shape(), target.dtype());
+            tracer.addEquation(new Equation(
+                List.of(targetVar, indicesVar, updatesVar),
+                List.of(outVar),
+                Primitive.SCATTER_ADD, null));
+            return new TracedNDArray(outVar);
+        }
+        return scatterAddEager(target, indices, updates);
+    }
+
+    /** Eager scatter-add; also used by Grad's forward re-interpretation. */
+    public static NDArray scatterAddEager(NDArray target, NDArray indices, NDArray updates) {
+        int[] idx = indices.toIntArray();
+        int[] targetDims = target.shape().dimensions();
+        int innerSize = 1;
+        for (int i = 1; i < targetDims.length; i++) innerSize *= targetDims[i];
+
+        if (target.dtype() == DType.FLOAT64) {
+            double[] out = target.toDoubleArray().clone();
+            double[] upd = updates.toDoubleArray();
+            for (int p = 0; p < idx.length; p++) {
+                int row = idx[p];
+                for (int d = 0; d < innerSize; d++) {
+                    out[row * innerSize + d] += upd[p * innerSize + d];
+                }
+            }
+            return new ConcreteNDArray(out, target.shape());
+        }
+        float[] out = target.toFloatArray().clone();
+        float[] upd = updates.toFloatArray();
+        for (int p = 0; p < idx.length; p++) {
+            int row = idx[p];
+            for (int d = 0; d < innerSize; d++) {
+                out[row * innerSize + d] += upd[p * innerSize + d];
+            }
+        }
+        return new ConcreteNDArray(out, target.shape());
     }
 }

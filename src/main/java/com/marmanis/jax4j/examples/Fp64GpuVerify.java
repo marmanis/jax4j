@@ -18,6 +18,7 @@ import java.util.List;
  * <pre>
  *   tornado --classpath ... com.marmanis.jax4j.examples.Fp64GpuVerify
  * </pre>
+ * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public class Fp64GpuVerify {
     public static void main(String[] args) {

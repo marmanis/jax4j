@@ -3,6 +3,9 @@ package com.marmanis.jax4j.core;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
+import uk.ac.manchester.tornado.api.TornadoRuntime;
+import uk.ac.manchester.tornado.api.TornadoBackend;
+import uk.ac.manchester.tornado.api.runtime.TornadoRuntimeProvider;
 import uk.ac.manchester.tornado.api.common.TornadoDevice;
 import uk.ac.manchester.tornado.api.enums.TornadoDeviceType;
 
@@ -56,17 +59,21 @@ public class Device {
         
         cachedDevices = new ArrayList<>();
         try {
-            // Check first few drivers and devices
-            for (int i = 0; i < 2; i++) {
-                for (int j = 0; j < 4; j++) {
-                    try {
-                        TornadoDevice d = TornadoExecutionPlan.getDevice(i, j);
-                        if (d != null) {
-                            cachedDevices.add(new Device(d));
+            TornadoRuntime runtime = TornadoRuntimeProvider.getTornadoRuntime();
+            int numBackends = runtime.getNumBackends();
+            for (int i = 0; i < numBackends; i++) {
+                TornadoBackend backend = runtime.getBackend(i);
+                if (backend != null) {
+                    int numDevices = backend.getNumDevices();
+                    for (int j = 0; j < numDevices; j++) {
+                        try {
+                            TornadoDevice d = backend.getDevice(j);
+                            if (d != null) {
+                                cachedDevices.add(new Device(d));
+                            }
+                        } catch (Throwable t) {
+                            log.debug("No more TornadoVM devices on backend {} after slot {}: {}", i, j, t.getMessage());
                         }
-                    } catch (Throwable t) {
-                        log.debug("No more TornadoVM devices on driver {} after slot {}: {}", i, j, t.getMessage());
-                        break;
                     }
                 }
             }

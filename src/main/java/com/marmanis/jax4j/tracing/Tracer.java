@@ -34,7 +34,7 @@ public class Tracer {
         ThreadLocal.withInitial(ArrayDeque::new);
 
     private final List<Equation> equations = new ArrayList<>();
-    private final AtomicInteger varCounter = new AtomicInteger(0);
+    private static final AtomicInteger varCounter = new AtomicInteger(0);
     private final Map<Integer, NDArray> consts = new HashMap<>();
 
     public static void start() {

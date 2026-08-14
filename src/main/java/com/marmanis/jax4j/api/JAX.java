@@ -15,6 +15,7 @@ import com.marmanis.jax4j.tracing.TracedNDArray;
 import com.marmanis.jax4j.tracing.Tracer;
 import com.marmanis.jax4j.backend.TornadoJitCompiler;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.function.BiFunction;
@@ -137,18 +138,35 @@ public class JAX {
      * {@code Grad.grad(fn).apply(arg)} eagerly.
      */
     public static Function<NDArray, NDArray> jitGrad(Function<NDArray, NDArray> fn) {
-        java.util.concurrent.ConcurrentHashMap<TraceSignature, Jaxpr> cache =
+        java.util.concurrent.ConcurrentHashMap<TraceSignature, Object> cache =
             new java.util.concurrent.ConcurrentHashMap<>();
         return (arg) -> {
             if (Tracer.current() != null) {
                 return Grad.grad(fn).apply(arg);
             }
             TraceSignature key = new TraceSignature(arg.shape(), arg.dtype());
-            Jaxpr jaxpr = cache.computeIfAbsent(key, k -> make_jaxpr(fn, arg));
-            // Seed backward with ones of the appropriate shape/dtype.
-            com.marmanis.jax4j.ir.Var outVar = jaxpr.outVars().get(0);
-            NDArray seed = onesFor(outVar);
-            return Grad.backwardInterpret(jaxpr, List.of(arg), List.of(seed)).get(0);
+            if (arg.device().getTornadoDevice() == null) {
+                // Host JIT: interpret combined grad jaxpr
+                Jaxpr jaxpr = (Jaxpr) cache.computeIfAbsent(key, k -> make_jaxpr(Grad.grad(fn), arg));
+                return Grad.forwardInterpret(jaxpr, List.of(arg)).get(0);
+            } else {
+                // GPU/TornadoVM JIT: compile combined grad jaxpr
+                Object plan = cache.compute(key, (k, existing) -> {
+                    if (existing != null) return existing;
+                    Jaxpr jaxpr = make_jaxpr(Grad.grad(fn), arg);
+                    try {
+                        return TornadoJitCompiler.compile(jaxpr, arg.device());
+                    } catch (Throwable t) {
+                        return jaxpr;
+                    }
+                });
+
+                if (plan instanceof Jaxpr jaxpr) {
+                    return Grad.forwardInterpret(jaxpr, List.of(arg)).get(0);
+                } else {
+                    return ((TornadoJitCompiler.CompiledPlan) plan).execute(List.of(arg), arg.device());
+                }
+            }
         };
     }
 
@@ -168,7 +186,7 @@ public class JAX {
      * {@link Grad#gradTree(Function)} eagerly.
      */
     public static Function<PyTree, PyTree> jitGradTree(Function<PyTree, NDArray> fn) {
-        java.util.concurrent.ConcurrentHashMap<TreeSignature, Jaxpr> cache =
+        java.util.concurrent.ConcurrentHashMap<TreeSignature, Object> cache =
             new java.util.concurrent.ConcurrentHashMap<>();
         return (paramsTree) -> {
             if (Tracer.current() != null) {
@@ -176,30 +194,95 @@ public class JAX {
             }
             List<NDArray> leaves = com.marmanis.jax4j.pytree.PyTrees.flatten(paramsTree);
             TreeSignature key = TreeSignature.of(leaves);
-            Jaxpr jaxpr = cache.computeIfAbsent(key, k -> traceGradTree(fn, paramsTree, leaves));
-            com.marmanis.jax4j.ir.Var outVar = jaxpr.outVars().get(0);
-            NDArray seed = onesFor(outVar);
-            List<NDArray> grads = Grad.backwardInterpret(jaxpr, leaves, List.of(seed));
-            return com.marmanis.jax4j.pytree.PyTrees.unflatten(paramsTree, grads);
+            Device device = Device.defaultDevice();
+            for (NDArray leaf : leaves) {
+                if (leaf != null) {
+                    device = leaf.device();
+                    break;
+                }
+            }
+            final Device deviceToUse = device;
+
+            if (deviceToUse.getTornadoDevice() == null) {
+                // Host JIT: interpret combined gradTree jaxpr
+                Jaxpr jaxpr = (Jaxpr) cache.computeIfAbsent(key, k -> traceGradTreeCombined(fn, paramsTree, leaves));
+                List<NDArray> nonNullLeaves = new ArrayList<>();
+                for (NDArray leaf : leaves) {
+                    if (leaf != null) nonNullLeaves.add(leaf);
+                }
+                List<NDArray> rawGrads = Grad.forwardInterpret(jaxpr, nonNullLeaves);
+                List<NDArray> grads = reconstructGrads(leaves, rawGrads);
+                return com.marmanis.jax4j.pytree.PyTrees.unflatten(paramsTree, grads);
+            } else {
+                // GPU/TornadoVM JIT: compile combined gradTree jaxpr
+                Object plan = cache.compute(key, (k, existing) -> {
+                    if (existing != null) return existing;
+                    Jaxpr jaxpr = traceGradTreeCombined(fn, paramsTree, leaves);
+                    try {
+                        return TornadoJitCompiler.compile(jaxpr, deviceToUse);
+                    } catch (Throwable t) {
+                        return jaxpr;
+                    }
+                });
+
+                List<NDArray> rawGrads;
+                List<NDArray> nonNullLeaves = new ArrayList<>();
+                for (NDArray leaf : leaves) {
+                    if (leaf != null) nonNullLeaves.add(leaf);
+                }
+
+                if (plan instanceof Jaxpr jaxpr) {
+                    rawGrads = Grad.forwardInterpret(jaxpr, nonNullLeaves);
+                } else {
+                    rawGrads = ((TornadoJitCompiler.CompiledPlan) plan).executeMulti(nonNullLeaves, deviceToUse);
+                }
+                List<NDArray> grads = reconstructGrads(leaves, rawGrads);
+                return com.marmanis.jax4j.pytree.PyTrees.unflatten(paramsTree, grads);
+            }
         };
     }
 
-    /** Trace {@code fn} with fresh {@link TracedNDArray}s for each leaf. */
-    private static Jaxpr traceGradTree(Function<PyTree, NDArray> fn, PyTree structureSample,
-                                       List<NDArray> leaves) {
+
+
+    private static List<NDArray> reconstructGrads(List<NDArray> leaves, List<NDArray> rawGrads) {
+        List<NDArray> grads = new ArrayList<>();
+        int gradsIdx = 0;
+        for (NDArray leaf : leaves) {
+            if (leaf == null) {
+                grads.add(null);
+            } else {
+                grads.add(rawGrads.get(gradsIdx++));
+            }
+        }
+        return grads;
+    }
+
+    /** Trace the combined forward and backward pass of gradTree. */
+    private static Jaxpr traceGradTreeCombined(Function<PyTree, NDArray> fn, PyTree structureSample,
+                                               List<NDArray> leaves) {
         Tracer.start();
         try {
             java.util.List<com.marmanis.jax4j.ir.Var> inVars = new java.util.ArrayList<>();
             java.util.List<NDArray> tracedLeaves = new java.util.ArrayList<>();
             for (NDArray leaf : leaves) {
-                com.marmanis.jax4j.ir.Var v = Tracer.current().nextVar(leaf.shape(), leaf.dtype());
-                inVars.add(v);
-                tracedLeaves.add(new TracedNDArray(v));
+                if (leaf == null) {
+                    tracedLeaves.add(null);
+                } else {
+                    com.marmanis.jax4j.ir.Var v = Tracer.current().nextVar(leaf.shape(), leaf.dtype());
+                    inVars.add(v);
+                    tracedLeaves.add(new TracedNDArray(v));
+                }
             }
             PyTree tracedTree = com.marmanis.jax4j.pytree.PyTrees.unflatten(structureSample, tracedLeaves);
-            NDArray result = fn.apply(tracedTree);
-            com.marmanis.jax4j.ir.Var outVar = ((TracedNDArray) result).getVar();
-            return Tracer.stop(inVars, List.of(outVar));
+            PyTree gradTree = Grad.gradTree(fn).apply(tracedTree);
+            List<NDArray> gradLeaves = com.marmanis.jax4j.pytree.PyTrees.flatten(gradTree);
+            java.util.List<com.marmanis.jax4j.ir.Var> outVars = new java.util.ArrayList<>();
+            for (NDArray gl : gradLeaves) {
+                if (gl != null) {
+                    outVars.add(((TracedNDArray) gl).getVar());
+                }
+            }
+            return Tracer.stop(inVars, outVars);
         } catch (RuntimeException | Error e) {
             Tracer.abort();
             throw e;
@@ -217,8 +300,10 @@ public class JAX {
     private record TreeSignature(java.util.List<TraceSignature> leafSignatures) {
         static TreeSignature of(java.util.List<NDArray> leaves) {
             java.util.List<TraceSignature> sigs = new java.util.ArrayList<>(leaves.size());
-            for (NDArray leaf : leaves) sigs.add(new TraceSignature(leaf.shape(), leaf.dtype()));
-            return new TreeSignature(java.util.List.copyOf(sigs));
+            for (NDArray leaf : leaves) {
+                sigs.add(leaf == null ? null : new TraceSignature(leaf.shape(), leaf.dtype()));
+            }
+            return new TreeSignature(sigs);
         }
     }
 
@@ -438,5 +523,118 @@ public class JAX {
                 new CustomVjpMeta(fn, vjpFn)));
             return new TracedNDArray(outVar);
         };
+    }
+
+    /**
+     * Computes the Jacobian of {@code fn} at {@code arg} using forward-mode AD (JVP).
+     * The input array must be 1-D of size N, and the output must be 1-D of size M.
+     * The returned Jacobian has shape [M, N].
+     */
+    public static NDArray jacfwd(Function<NDArray, NDArray> fn, NDArray arg) {
+        com.marmanis.jax4j.core.Shape inShape = arg.shape();
+        if (inShape.rank() != 1) {
+            throw new IllegalArgumentException("jacfwd expects a 1-D input array");
+        }
+        int n = inShape.dimensions()[0];
+
+        NDArray zeroTangent = arg.dtype() == DType.FLOAT64
+            ? new com.marmanis.jax4j.core.ConcreteNDArray(new double[n], inShape, arg.device())
+            : new com.marmanis.jax4j.core.ConcreteNDArray(new float[n], inShape, DType.FLOAT32, arg.device());
+
+        NDArray[] valAndTangent0 = jvp(fn, arg, zeroTangent);
+        com.marmanis.jax4j.core.Shape outShape = valAndTangent0[0].shape();
+        if (outShape.rank() != 1) {
+            throw new IllegalArgumentException("jacfwd expects a 1-D output array");
+        }
+        int m = outShape.dimensions()[0];
+
+        java.util.List<NDArray> columns = new java.util.ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            NDArray tangent;
+            if (arg.dtype() == DType.FLOAT64) {
+                double[] basisData = new double[n];
+                basisData[i] = 1.0;
+                tangent = new com.marmanis.jax4j.core.ConcreteNDArray(basisData, inShape, arg.device());
+            } else {
+                float[] basisData = new float[n];
+                basisData[i] = 1.0f;
+                tangent = new com.marmanis.jax4j.core.ConcreteNDArray(basisData, inShape, DType.FLOAT32, arg.device());
+            }
+            NDArray[] res = jvp(fn, arg, tangent);
+            columns.add(res[1]);
+        }
+
+        if (arg.dtype() == DType.FLOAT64) {
+            double[] jacData = new double[m * n];
+            for (int i = 0; i < n; i++) {
+                double[] col = columns.get(i).toDoubleArray();
+                for (int j = 0; j < m; j++) {
+                    jacData[j * n + i] = col[j];
+                }
+            }
+            return new com.marmanis.jax4j.core.ConcreteNDArray(jacData, new com.marmanis.jax4j.core.Shape(m, n), arg.device());
+        } else {
+            float[] jacData = new float[m * n];
+            for (int i = 0; i < n; i++) {
+                float[] col = columns.get(i).toFloatArray();
+                for (int j = 0; j < m; j++) {
+                    jacData[j * n + i] = col[j];
+                }
+            }
+            return new com.marmanis.jax4j.core.ConcreteNDArray(jacData, new com.marmanis.jax4j.core.Shape(m, n), DType.FLOAT32, arg.device());
+        }
+    }
+
+    /**
+     * Computes the Jacobian of {@code fn} at {@code arg} using reverse-mode AD (VJP).
+     * The input array must be 1-D of size N, and the output must be 1-D of size M.
+     * The returned Jacobian has shape [M, N].
+     */
+    public static NDArray jacrev(Function<NDArray, NDArray> fn, NDArray arg) {
+        com.marmanis.jax4j.core.Shape inShape = arg.shape();
+        if (inShape.rank() != 1) {
+            throw new IllegalArgumentException("jacrev expects a 1-D input array");
+        }
+        int n = inShape.dimensions()[0];
+
+        Jaxpr jaxpr = make_jaxpr(fn, arg);
+        NDArray val = Grad.forwardInterpret(jaxpr, List.of(arg)).get(0);
+        com.marmanis.jax4j.core.Shape outShape = val.shape();
+        if (outShape.rank() != 1) {
+            throw new IllegalArgumentException("jacrev expects a 1-D output array");
+        }
+        int m = outShape.dimensions()[0];
+
+        java.util.List<NDArray> rows = new java.util.ArrayList<>(m);
+        for (int j = 0; j < m; j++) {
+            NDArray cotangent;
+            if (val.dtype() == DType.FLOAT64) {
+                double[] basisData = new double[m];
+                basisData[j] = 1.0;
+                cotangent = new com.marmanis.jax4j.core.ConcreteNDArray(basisData, outShape, val.device());
+            } else {
+                float[] basisData = new float[m];
+                basisData[j] = 1.0f;
+                cotangent = new com.marmanis.jax4j.core.ConcreteNDArray(basisData, outShape, DType.FLOAT32, val.device());
+            }
+            List<NDArray> grad = Grad.backwardInterpret(jaxpr, List.of(arg), List.of(cotangent));
+            rows.add(grad.get(0));
+        }
+
+        if (val.dtype() == DType.FLOAT64) {
+            double[] jacData = new double[m * n];
+            for (int j = 0; j < m; j++) {
+                double[] row = rows.get(j).toDoubleArray();
+                System.arraycopy(row, 0, jacData, j * n, n);
+            }
+            return new com.marmanis.jax4j.core.ConcreteNDArray(jacData, new com.marmanis.jax4j.core.Shape(m, n), val.device());
+        } else {
+            float[] jacData = new float[m * n];
+            for (int j = 0; j < m; j++) {
+                float[] row = rows.get(j).toFloatArray();
+                System.arraycopy(row, 0, jacData, j * n, n);
+            }
+            return new com.marmanis.jax4j.core.ConcreteNDArray(jacData, new com.marmanis.jax4j.core.Shape(m, n), DType.FLOAT32, val.device());
+        }
     }
 }

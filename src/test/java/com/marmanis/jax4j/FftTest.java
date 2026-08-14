@@ -290,6 +290,70 @@ public class FftTest {
             () -> Fft.dctIRaw(new double[0]));
     }
 
+    // -----------------------------------------------------------------
+    // Batched dctI — rank-2 NDArray + double[][] raw overload
+    // -----------------------------------------------------------------
+
+    @Test
+    public void testDctIBatchedNdArrayMatchesRowwise() {
+        int n = 33;
+        int batch = 5;
+        java.util.Random rng = new java.util.Random(0xB47ED0C7);
+        double[] flat = new double[batch * n];
+        for (int i = 0; i < flat.length; i++) flat[i] = rng.nextGaussian();
+
+        NDArray batched = new ConcreteNDArray(flat.clone(), new Shape(batch, n));
+        double[] outFlat = Fft.dctI(batched).toDoubleArray();
+
+        // Each row should equal the per-row scalar DCT.
+        for (int b = 0; b < batch; b++) {
+            double[] row = new double[n];
+            System.arraycopy(flat, b * n, row, 0, n);
+            double[] expected = Fft.dctIRaw(row);
+            for (int k = 0; k < n; k++) {
+                if (outFlat[b * n + k] != expected[k]) {
+                    throw new AssertionError(
+                        "batched dctI row " + b + " k=" + k + ": got "
+                        + outFlat[b * n + k] + " expected " + expected[k]);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testDctIRawBatchedMatchesRowwise() {
+        int n = 65;
+        int batch = 4;
+        java.util.Random rng = new java.util.Random(0xBA6ED64L);
+        double[][] x = new double[batch][n];
+        for (int b = 0; b < batch; b++)
+            for (int j = 0; j < n; j++) x[b][j] = rng.nextGaussian();
+
+        double[][] y = Fft.dctIRaw(x);
+        assertEquals(batch, y.length);
+        for (int b = 0; b < batch; b++) {
+            double[] expected = Fft.dctIRaw(x[b]);
+            for (int k = 0; k < n; k++) {
+                if (y[b][k] != expected[k]) {
+                    throw new AssertionError(
+                        "batched dctIRaw row " + b + " k=" + k);
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testDctIRawBatchedRejectsRaggedRows() {
+        double[][] ragged = {{1, 2, 3, 4, 5}, {1, 2, 3, 4, 5, 6, 7, 8, 9}};
+        assertThrows(IllegalArgumentException.class, () -> Fft.dctIRaw(ragged));
+    }
+
+    @Test
+    public void testDctIRawBatchedEmptyReturnsEmpty() {
+        double[][] out = Fft.dctIRaw(new double[0][]);
+        assertEquals(0, out.length);
+    }
+
     @Test
     public void testFft3Ifft3RoundTripDouble() {
         int n0 = 8, n1 = 8, n2 = 8;

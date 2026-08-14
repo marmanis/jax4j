@@ -30,47 +30,69 @@ public class TornadoVMBackend implements ExecutionBackend {
     // ----------------------------------------------------------------
     // GAP-3: TaskGraph plan cache
     //
-    // Key: (primitive, array-size, isF64).
-    // Cached value: the pre-built plan together with its bound float[]
+    // Key: (primitive, array-size, isF64, device).
+    // Cached value: a pool of pre-built plans together with their bound float[]
     // buffers so we can copy fresh input data in before re-executing.
     // The TornadoVM transferToDevice(EVERY_EXECUTION, ...) mode reads
     // the array reference it was given at graph-construction time on
     // every execute() call, so writing new values into those arrays and
     // calling execute() again is the correct way to reuse a plan.
+    // We pool plans to allow concurrent executions (e.g. inside pmap)
+    // to borrow distinct buffers and plans without data races.
     // ----------------------------------------------------------------
 
-    private record CacheKey(Primitive primitive, int size, boolean isF64) {}
+    private record CacheKey(Primitive primitive, int size, int m, int k, int n, boolean isF64, Device device) {}
 
     private record CachedPlan(TornadoExecutionPlan plan,
                                float[] inA, float[] inB, float[] outF,
                                double[] inAd, double[] inBd, double[] outD) {}
 
-    private static final java.util.concurrent.ConcurrentHashMap<CacheKey, CachedPlan> PLAN_CACHE =
+    private static final java.util.concurrent.ConcurrentHashMap<CacheKey, java.util.concurrent.ConcurrentLinkedQueue<CachedPlan>> PLAN_CACHE =
         new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Maximum plans kept per (primitive, shape, dtype, device) cache key. Bounds the
+     * memory a burst of concurrent calls (e.g. pmap over D devices) can wedge into
+     * the cache; excess plans are closed rather than pooled. The size() check races
+     * under contention so the pool may grow slightly above the bound, but not
+     * unboundedly.
+     */
+    private static final int MAX_POOL_SIZE = 4;
+
+    private static void boundedOffer(java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool, CachedPlan plan) {
+        if (pool.size() < MAX_POOL_SIZE) {
+            pool.offer(plan);
+        } else {
+            try { plan.plan().close(); } catch (Throwable ignore) {}
+        }
+    }
 
     @Override
     public float[] binary(Primitive primitive, float[] a, float[] b, Device device) {
-        CacheKey key = new CacheKey(primitive, a.length, false);
-        CachedPlan cached = PLAN_CACHE.get(key);
+        CacheKey key = new CacheKey(primitive, a.length, 0, 0, 0, false, device);
+        java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool =
+            PLAN_CACHE.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedQueue<>());
+
+        CachedPlan cached = pool.poll();
         if (cached != null) {
-            // Cache hit: update bound buffers and re-execute.
-            // The plan's TaskGraph was built with EVERY_EXECUTION transfer mode,
-            // so writing into the same float[] arrays and calling execute() again
-            // uploads the fresh data automatically.
             try {
                 System.arraycopy(a, 0, cached.inA(), 0, a.length);
                 System.arraycopy(b, 0, cached.inB(), 0, b.length);
                 cached.plan().execute();
                 float[] out = new float[a.length];
                 System.arraycopy(cached.outF(), 0, out, 0, a.length);
+                boundedOffer(pool, cached); // return to pool on success
                 return out;
             } catch (Throwable t) {
                 log.warn("TornadoVM cached execution failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
+                try {
+                    cached.plan().close();
+                } catch (Throwable ignore) {}
                 return HostBackend.INSTANCE.binary(primitive, a, b, device);
             }
         }
 
-        // Cache miss: build, cache, execute.
+        // Cache miss: build, execute.
         float[] inA = a.clone();
         float[] inB = b.clone();
         float[] out = new float[a.length];
@@ -91,8 +113,11 @@ public class TornadoVMBackend implements ExecutionBackend {
             ImmutableTaskGraph itg = tg.snapshot();
             TornadoExecutionPlan plan = configuredPlan(itg, device);
             plan.execute();
-            // Store in cache (don't close the plan — it must stay alive for reuse).
-            PLAN_CACHE.putIfAbsent(key, new CachedPlan(plan, inA, inB, out, null, null, null));
+            
+            // Store in pool (don't close the plan — it must stay alive for reuse).
+            CachedPlan newPlan = new CachedPlan(plan, inA, inB, out, null, null, null);
+            boundedOffer(pool, newPlan);
+
             float[] result = new float[a.length];
             System.arraycopy(out, 0, result, 0, a.length);
             return result;
@@ -118,27 +143,55 @@ public class TornadoVMBackend implements ExecutionBackend {
 
     @Override
     public float[] unary(Primitive primitive, float[] a, Device device) {
+        CacheKey key = new CacheKey(primitive, a.length, 0, 0, 0, false, device);
+        java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool =
+            PLAN_CACHE.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedQueue<>());
+
+        CachedPlan cached = pool.poll();
+        if (cached != null) {
+            try {
+                System.arraycopy(a, 0, cached.inA(), 0, a.length);
+                cached.plan().execute();
+                float[] out = new float[a.length];
+                System.arraycopy(cached.outF(), 0, out, 0, a.length);
+                boundedOffer(pool, cached);
+                return out;
+            } catch (Throwable t) {
+                log.warn("TornadoVM cached execution failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
+                try {
+                    cached.plan().close();
+                } catch (Throwable ignore) {}
+                return HostBackend.INSTANCE.unary(primitive, a, device);
+            }
+        }
+
+        float[] inA = a.clone();
         float[] out = new float[a.length];
         try {
-            TaskGraph tg = new TaskGraph("jax4j_" + primitive)
-                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a);
+            TaskGraph tg = new TaskGraph("jax4j_" + primitive + "_" + a.length)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, inA);
             tg = switch (primitive) {
-                case EXP -> tg.task("k", TornadoVMBackend::vectorExp, a, out);
-                case LOG -> tg.task("k", TornadoVMBackend::vectorLog, a, out);
-                case SIN -> tg.task("k", TornadoVMBackend::vectorSin, a, out);
-                case COS -> tg.task("k", TornadoVMBackend::vectorCos, a, out);
-                case TANH -> tg.task("k", TornadoVMBackend::vectorTanh, a, out);
-                case RELU -> tg.task("k", TornadoVMBackend::vectorRelu, a, out);
-                case SIGMOID -> tg.task("k", TornadoVMBackend::vectorSigmoid, a, out);
+                case EXP -> tg.task("k", TornadoVMBackend::vectorExp, inA, out);
+                case LOG -> tg.task("k", TornadoVMBackend::vectorLog, inA, out);
+                case SIN -> tg.task("k", TornadoVMBackend::vectorSin, inA, out);
+                case COS -> tg.task("k", TornadoVMBackend::vectorCos, inA, out);
+                case TANH -> tg.task("k", TornadoVMBackend::vectorTanh, inA, out);
+                case RELU -> tg.task("k", TornadoVMBackend::vectorRelu, inA, out);
+                case SIGMOID -> tg.task("k", TornadoVMBackend::vectorSigmoid, inA, out);
                 default -> throw new UnsupportedOperationException("No TornadoVM kernel for " + primitive);
             };
             tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
 
             ImmutableTaskGraph itg = tg.snapshot();
-            try (TornadoExecutionPlan plan = configuredPlan(itg, device)) {
-                plan.execute();
-            }
-            return out;
+            TornadoExecutionPlan plan = configuredPlan(itg, device);
+            plan.execute();
+
+            CachedPlan newPlan = new CachedPlan(plan, inA, null, out, null, null, null);
+            boundedOffer(pool, newPlan);
+
+            float[] result = new float[a.length];
+            System.arraycopy(out, 0, result, 0, a.length);
+            return result;
         } catch (Throwable t) {
             log.warn("TornadoVM execution failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
             return HostBackend.INSTANCE.unary(primitive, a, device);
@@ -147,24 +200,56 @@ public class TornadoVMBackend implements ExecutionBackend {
 
     @Override
     public float[] reduce(Primitive primitive, float[] a, Device device) {
+        CacheKey key = new CacheKey(primitive, a.length, 0, 0, 0, false, device);
+        java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool =
+            PLAN_CACHE.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedQueue<>());
+
+        CachedPlan cached = pool.poll();
+        if (cached != null) {
+            try {
+                System.arraycopy(a, 0, cached.inA(), 0, a.length);
+                cached.outF()[0] = 0f; // reset accumulator for TornadoVM @Reduce
+                cached.plan().execute();
+                float[] out = new float[1];
+                out[0] = cached.outF()[0];
+                if (primitive == Primitive.MEAN) {
+                    out[0] /= a.length;
+                }
+                boundedOffer(pool, cached);
+                return out;
+            } catch (Throwable t) {
+                log.warn("TornadoVM cached reduction failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
+                try {
+                    cached.plan().close();
+                } catch (Throwable ignore) {}
+                return HostBackend.INSTANCE.reduce(primitive, a, device);
+            }
+        }
+
+        float[] inA = a.clone();
         float[] out = new float[1];
         try {
-            TaskGraph tg = new TaskGraph("jax4j_reduce_" + primitive)
-                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a);
+            TaskGraph tg = new TaskGraph("jax4j_reduce_" + primitive + "_" + a.length)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, inA);
             tg = switch (primitive) {
-                case SUM, MEAN -> tg.task("k", TornadoVMBackend::reduceSum, a, out);
+                case SUM, MEAN -> tg.task("k", TornadoVMBackend::reduceSum, inA, out);
                 default -> throw new UnsupportedOperationException("No TornadoVM reduction kernel for " + primitive);
             };
             tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
 
             ImmutableTaskGraph itg = tg.snapshot();
-            try (TornadoExecutionPlan plan = configuredPlan(itg, device)) {
-                plan.execute();
-            }
+            TornadoExecutionPlan plan = configuredPlan(itg, device);
+            plan.execute();
+
+            CachedPlan newPlan = new CachedPlan(plan, inA, null, out, null, null, null);
+            boundedOffer(pool, newPlan);
+
+            float[] result = new float[1];
+            result[0] = out[0];
             if (primitive == Primitive.MEAN) {
-                out[0] /= a.length;
+                result[0] /= a.length;
             }
-            return out;
+            return result;
         } catch (Throwable t) {
             log.warn("TornadoVM reduction failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
             return HostBackend.INSTANCE.reduce(primitive, a, device);
@@ -173,24 +258,56 @@ public class TornadoVMBackend implements ExecutionBackend {
 
     @Override
     public double[] reduce(Primitive primitive, double[] a, Device device) {
+        CacheKey key = new CacheKey(primitive, a.length, 0, 0, 0, true, device);
+        java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool =
+            PLAN_CACHE.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedQueue<>());
+
+        CachedPlan cached = pool.poll();
+        if (cached != null) {
+            try {
+                System.arraycopy(a, 0, cached.inAd(), 0, a.length);
+                cached.outD()[0] = 0.0; // reset accumulator for TornadoVM @Reduce
+                cached.plan().execute();
+                double[] out = new double[1];
+                out[0] = cached.outD()[0];
+                if (primitive == Primitive.MEAN) {
+                    out[0] /= a.length;
+                }
+                boundedOffer(pool, cached);
+                return out;
+            } catch (Throwable t) {
+                log.warn("TornadoVM cached FP64 reduction failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
+                try {
+                    cached.plan().close();
+                } catch (Throwable ignore) {}
+                return HostBackend.INSTANCE.reduce(primitive, a, device);
+            }
+        }
+
+        double[] inAd = a.clone();
         double[] out = new double[1];
         try {
-            TaskGraph tg = new TaskGraph("jax4j_reduce_" + primitive + "_d")
-                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a);
+            TaskGraph tg = new TaskGraph("jax4j_reduce_" + primitive + "_d_" + a.length)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, inAd);
             tg = switch (primitive) {
-                case SUM, MEAN -> tg.task("k", TornadoVMBackend::reduceSumD, a, out);
+                case SUM, MEAN -> tg.task("k", TornadoVMBackend::reduceSumD, inAd, out);
                 default -> throw new UnsupportedOperationException("No TornadoVM FP64 reduction kernel for " + primitive);
             };
             tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
 
             ImmutableTaskGraph itg = tg.snapshot();
-            try (TornadoExecutionPlan plan = configuredPlan(itg, device)) {
-                plan.execute();
-            }
+            TornadoExecutionPlan plan = configuredPlan(itg, device);
+            plan.execute();
+
+            CachedPlan newPlan = new CachedPlan(plan, null, null, null, inAd, null, out);
+            boundedOffer(pool, newPlan);
+
+            double[] result = new double[1];
+            result[0] = out[0];
             if (primitive == Primitive.MEAN) {
-                out[0] /= a.length;
+                result[0] /= a.length;
             }
-            return out;
+            return result;
         } catch (Throwable t) {
             log.warn("TornadoVM FP64 reduction failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
             return HostBackend.INSTANCE.reduce(primitive, a, device);
@@ -251,18 +368,48 @@ public class TornadoVMBackend implements ExecutionBackend {
 
     @Override
     public float[] matmul(float[] a, float[] b, int m, int k, int n, Device device) {
+        CacheKey key = new CacheKey(Primitive.DOT, a.length, m, k, n, false, device);
+        java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool =
+            PLAN_CACHE.computeIfAbsent(key, k_ -> new java.util.concurrent.ConcurrentLinkedQueue<>());
+
+        CachedPlan cached = pool.poll();
+        if (cached != null) {
+            try {
+                System.arraycopy(a, 0, cached.inA(), 0, a.length);
+                System.arraycopy(b, 0, cached.inB(), 0, b.length);
+                cached.plan().execute();
+                float[] out = new float[m * n];
+                System.arraycopy(cached.outF(), 0, out, 0, out.length);
+                boundedOffer(pool, cached);
+                return out;
+            } catch (Throwable t) {
+                log.warn("TornadoVM cached matmul failed on {}, falling back to host: {}", device, t.getMessage());
+                try {
+                    cached.plan().close();
+                } catch (Throwable ignore) {}
+                return HostBackend.INSTANCE.matmul(a, b, m, k, n, device);
+            }
+        }
+
+        float[] inA = a.clone();
+        float[] inB = b.clone();
         float[] out = new float[m * n];
         try {
-            TaskGraph tg = new TaskGraph("jax4j_matmul")
-                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a, b)
-                .task("k", TornadoVMBackend::matmulKernel, a, b, out, m, k, n)
+            TaskGraph tg = new TaskGraph("jax4j_matmul_" + m + "_" + k + "_" + n)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, inA, inB)
+                .task("k", TornadoVMBackend::matmulKernel, inA, inB, out, m, k, n)
                 .transferToHost(DataTransferMode.EVERY_EXECUTION, out);
 
             ImmutableTaskGraph itg = tg.snapshot();
-            try (TornadoExecutionPlan plan = configuredPlan(itg, device)) {
-                plan.execute();
-            }
-            return out;
+            TornadoExecutionPlan plan = configuredPlan(itg, device);
+            plan.execute();
+
+            CachedPlan newPlan = new CachedPlan(plan, inA, inB, out, null, null, null);
+            boundedOffer(pool, newPlan);
+
+            float[] result = new float[m * n];
+            System.arraycopy(out, 0, result, 0, out.length);
+            return result;
         } catch (Throwable t) {
             log.warn("TornadoVM matmul failed on {}, falling back to host: {}", device, t.getMessage());
             return HostBackend.INSTANCE.matmul(a, b, m, k, n, device);
@@ -291,25 +438,55 @@ public class TornadoVMBackend implements ExecutionBackend {
 
     @Override
     public double[] binary(Primitive primitive, double[] a, double[] b, Device device) {
+        CacheKey key = new CacheKey(primitive, a.length, 0, 0, 0, true, device);
+        java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool =
+            PLAN_CACHE.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedQueue<>());
+
+        CachedPlan cached = pool.poll();
+        if (cached != null) {
+            try {
+                System.arraycopy(a, 0, cached.inAd(), 0, a.length);
+                System.arraycopy(b, 0, cached.inBd(), 0, b.length);
+                cached.plan().execute();
+                double[] out = new double[a.length];
+                System.arraycopy(cached.outD(), 0, out, 0, a.length);
+                boundedOffer(pool, cached);
+                return out;
+            } catch (Throwable t) {
+                log.warn("TornadoVM cached execution failed for FP64 {} on {}, falling back to host: {}", primitive, device, t.getMessage());
+                try {
+                    cached.plan().close();
+                } catch (Throwable ignore) {}
+                return HostBackend.INSTANCE.binary(primitive, a, b, device);
+            }
+        }
+
+        double[] inAd = a.clone();
+        double[] inBd = b.clone();
         double[] out = new double[a.length];
         try {
-            TaskGraph tg = new TaskGraph("jax4j_" + primitive + "_d")
-                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a, b);
+            TaskGraph tg = new TaskGraph("jax4j_" + primitive + "_d_" + a.length)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, inAd, inBd);
             tg = switch (primitive) {
-                case ADD -> tg.task("k", TornadoVMBackend::vectorAddD, a, b, out);
-                case SUB -> tg.task("k", TornadoVMBackend::vectorSubD, a, b, out);
-                case MUL -> tg.task("k", TornadoVMBackend::vectorMulD, a, b, out);
-                case DIV -> tg.task("k", TornadoVMBackend::vectorDivD, a, b, out);
-                case MAX -> tg.task("k", TornadoVMBackend::vectorMaxD, a, b, out);
-                case MIN -> tg.task("k", TornadoVMBackend::vectorMinD, a, b, out);
+                case ADD -> tg.task("k", TornadoVMBackend::vectorAddD, inAd, inBd, out);
+                case SUB -> tg.task("k", TornadoVMBackend::vectorSubD, inAd, inBd, out);
+                case MUL -> tg.task("k", TornadoVMBackend::vectorMulD, inAd, inBd, out);
+                case DIV -> tg.task("k", TornadoVMBackend::vectorDivD, inAd, inBd, out);
+                case MAX -> tg.task("k", TornadoVMBackend::vectorMaxD, inAd, inBd, out);
+                case MIN -> tg.task("k", TornadoVMBackend::vectorMinD, inAd, inBd, out);
                 default -> throw new UnsupportedOperationException("No FP64 TornadoVM kernel for " + primitive);
             };
             tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
             ImmutableTaskGraph itg = tg.snapshot();
-            try (TornadoExecutionPlan plan = configuredPlan(itg, device)) {
-                plan.execute();
-            }
-            return out;
+            TornadoExecutionPlan plan = configuredPlan(itg, device);
+            plan.execute();
+
+            CachedPlan newPlan = new CachedPlan(plan, null, null, null, inAd, inBd, out);
+            boundedOffer(pool, newPlan);
+
+            double[] result = new double[a.length];
+            System.arraycopy(out, 0, result, 0, a.length);
+            return result;
         } catch (Throwable t) {
             log.warn("TornadoVM FP64 execution failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
             return HostBackend.INSTANCE.binary(primitive, a, b, device);
@@ -318,26 +495,54 @@ public class TornadoVMBackend implements ExecutionBackend {
 
     @Override
     public double[] unary(Primitive primitive, double[] a, Device device) {
+        CacheKey key = new CacheKey(primitive, a.length, 0, 0, 0, true, device);
+        java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool =
+            PLAN_CACHE.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedQueue<>());
+
+        CachedPlan cached = pool.poll();
+        if (cached != null) {
+            try {
+                System.arraycopy(a, 0, cached.inAd(), 0, a.length);
+                cached.plan().execute();
+                double[] out = new double[a.length];
+                System.arraycopy(cached.outD(), 0, out, 0, a.length);
+                boundedOffer(pool, cached);
+                return out;
+            } catch (Throwable t) {
+                log.warn("TornadoVM cached FP64 execution failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
+                try {
+                    cached.plan().close();
+                } catch (Throwable ignore) {}
+                return HostBackend.INSTANCE.unary(primitive, a, device);
+            }
+        }
+
+        double[] inAd = a.clone();
         double[] out = new double[a.length];
         try {
-            TaskGraph tg = new TaskGraph("jax4j_" + primitive + "_d")
-                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a);
+            TaskGraph tg = new TaskGraph("jax4j_" + primitive + "_d_" + a.length)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, inAd);
             tg = switch (primitive) {
-                case EXP  -> tg.task("k", TornadoVMBackend::vectorExpD, a, out);
-                case LOG  -> tg.task("k", TornadoVMBackend::vectorLogD, a, out);
-                case SIN  -> tg.task("k", TornadoVMBackend::vectorSinD, a, out);
-                case COS  -> tg.task("k", TornadoVMBackend::vectorCosD, a, out);
-                case TANH -> tg.task("k", TornadoVMBackend::vectorTanhD, a, out);
-                case RELU -> tg.task("k", TornadoVMBackend::vectorReluD, a, out);
-                case SIGMOID -> tg.task("k", TornadoVMBackend::vectorSigmoidD, a, out);
+                case EXP  -> tg.task("k", TornadoVMBackend::vectorExpD, inAd, out);
+                case LOG  -> tg.task("k", TornadoVMBackend::vectorLogD, inAd, out);
+                case SIN  -> tg.task("k", TornadoVMBackend::vectorSinD, inAd, out);
+                case COS  -> tg.task("k", TornadoVMBackend::vectorCosD, inAd, out);
+                case TANH -> tg.task("k", TornadoVMBackend::vectorTanhD, inAd, out);
+                case RELU -> tg.task("k", TornadoVMBackend::vectorReluD, inAd, out);
+                case SIGMOID -> tg.task("k", TornadoVMBackend::vectorSigmoidD, inAd, out);
                 default -> throw new UnsupportedOperationException("No FP64 TornadoVM kernel for " + primitive);
             };
             tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
             ImmutableTaskGraph itg = tg.snapshot();
-            try (TornadoExecutionPlan plan = configuredPlan(itg, device)) {
-                plan.execute();
-            }
-            return out;
+            TornadoExecutionPlan plan = configuredPlan(itg, device);
+            plan.execute();
+
+            CachedPlan newPlan = new CachedPlan(plan, null, null, null, inAd, null, out);
+            boundedOffer(pool, newPlan);
+
+            double[] result = new double[a.length];
+            System.arraycopy(out, 0, result, 0, a.length);
+            return result;
         } catch (Throwable t) {
             log.warn("TornadoVM FP64 execution failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
             return HostBackend.INSTANCE.unary(primitive, a, device);
@@ -346,17 +551,47 @@ public class TornadoVMBackend implements ExecutionBackend {
 
     @Override
     public double[] matmul(double[] a, double[] b, int m, int k, int n, Device device) {
+        CacheKey key = new CacheKey(Primitive.DOT, a.length, m, k, n, true, device);
+        java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool =
+            PLAN_CACHE.computeIfAbsent(key, k_ -> new java.util.concurrent.ConcurrentLinkedQueue<>());
+
+        CachedPlan cached = pool.poll();
+        if (cached != null) {
+            try {
+                System.arraycopy(a, 0, cached.inAd(), 0, a.length);
+                System.arraycopy(b, 0, cached.inBd(), 0, b.length);
+                cached.plan().execute();
+                double[] out = new double[m * n];
+                System.arraycopy(cached.outD(), 0, out, 0, out.length);
+                boundedOffer(pool, cached);
+                return out;
+            } catch (Throwable t) {
+                log.warn("TornadoVM cached FP64 matmul failed on {}, falling back to host: {}", device, t.getMessage());
+                try {
+                    cached.plan().close();
+                } catch (Throwable ignore) {}
+                return HostBackend.INSTANCE.matmul(a, b, m, k, n, device);
+            }
+        }
+
+        double[] inAd = a.clone();
+        double[] inBd = b.clone();
         double[] out = new double[m * n];
         try {
-            TaskGraph tg = new TaskGraph("jax4j_matmul_d")
-                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a, b)
-                .task("k", TornadoVMBackend::matmulKernelD, a, b, out, m, k, n)
+            TaskGraph tg = new TaskGraph("jax4j_matmul_d_" + m + "_" + k + "_" + n)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, inAd, inBd)
+                .task("k", TornadoVMBackend::matmulKernelD, inAd, inBd, out, m, k, n)
                 .transferToHost(DataTransferMode.EVERY_EXECUTION, out);
             ImmutableTaskGraph itg = tg.snapshot();
-            try (TornadoExecutionPlan plan = configuredPlan(itg, device)) {
-                plan.execute();
-            }
-            return out;
+            TornadoExecutionPlan plan = configuredPlan(itg, device);
+            plan.execute();
+
+            CachedPlan newPlan = new CachedPlan(plan, null, null, null, inAd, inBd, out);
+            boundedOffer(pool, newPlan);
+
+            double[] result = new double[m * n];
+            System.arraycopy(out, 0, result, 0, out.length);
+            return result;
         } catch (Throwable t) {
             log.warn("TornadoVM FP64 matmul failed on {}, falling back to host: {}", device, t.getMessage());
             return HostBackend.INSTANCE.matmul(a, b, m, k, n, device);

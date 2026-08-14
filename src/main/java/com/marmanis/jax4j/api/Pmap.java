@@ -102,7 +102,7 @@ final class Pmap {
         runParallel(D, i -> {
             PmapContext.set(new PmapContext(i, D, collective));
             try {
-                results[i] = Grad.forwardInterpret(bodyJaxpr, List.of(inputShards[i])).get(0);
+                results[i] = Grad.forwardInterpret(bodyJaxpr, List.of(inputShards[i].to(devices.get(i)))).get(0);
             } finally {
                 PmapContext.clear();
             }
@@ -125,7 +125,10 @@ final class Pmap {
             PmapContext.set(new PmapContext(i, D, collective));
             try {
                 gInputShards[i] = Grad.backwardInterpret(
-                    bodyJaxpr, List.of(inputShards[i]), List.of(gOutShards[i])).get(0);
+                    bodyJaxpr,
+                    List.of(inputShards[i].to(devices.get(i))),
+                    List.of(gOutShards[i].to(devices.get(i)))
+                ).get(0);
             } finally {
                 PmapContext.clear();
             }

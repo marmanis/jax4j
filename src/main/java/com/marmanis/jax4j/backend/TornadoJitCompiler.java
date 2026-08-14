@@ -41,7 +41,7 @@ public class TornadoJitCompiler {
             this.meanPostProcesses = meanPostProcesses;
         }
 
-        public NDArray execute(List<NDArray> args, Device device) {
+        public List<NDArray> executeMulti(List<NDArray> args, Device device) {
             // 1. Copy concrete inputs to JVM JIT-allocated arrays.
             for (int i = 0; i < args.size(); i++) {
                 NDArray arg = args.get(i);
@@ -63,13 +63,20 @@ public class TornadoJitCompiler {
                 out[0] /= mpp.count;
             }
 
-            // 4. Retrieve final output array.
-            Var outVar = outVars.get(0);
-            float[] outData = arrays.get(outVar.id());
-            // Create a copy of the output array.
-            float[] res = new float[outData.length];
-            System.arraycopy(outData, 0, res, 0, outData.length);
-            return new ConcreteNDArray(res, outVar.shape(), outVar.dtype(), device);
+            // 4. Retrieve final output arrays.
+            List<NDArray> results = new ArrayList<>();
+            for (Var outVar : outVars) {
+                float[] outData = arrays.get(outVar.id());
+                // Create a copy of the output array.
+                float[] res = new float[outData.length];
+                System.arraycopy(outData, 0, res, 0, outData.length);
+                results.add(new ConcreteNDArray(res, outVar.shape(), outVar.dtype(), device));
+            }
+            return results;
+        }
+
+        public NDArray execute(List<NDArray> args, Device device) {
+            return executeMulti(args, device).get(0);
         }
 
         public void close() {

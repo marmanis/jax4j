@@ -71,7 +71,7 @@ final class SharedCollective {
         int[] newDims = new int[shardShape.rank() + 1];
         newDims[0] = numDevices;
         System.arraycopy(shardShape.dimensions(), 0, newDims, 1, shardShape.rank());
-        NDArray result = new ConcreteNDArray(out, new Shape(newDims));
+        NDArray result = new ConcreteNDArray(out, new Shape(newDims)).to(shard.device());
         await();  // phase 2: all shards have finished reading
         return result;
     }

@@ -110,4 +110,30 @@ public class SelectionOpsTest {
         NDArray result = Vmap.vmap(rowArgmax).apply(batch);
         assertArrayEquals(new int[]{1, 0}, result.toIntArray());
     }
+
+    @Test
+    public void argmaxAbsPicksMaxMagnitudeElementFlat() {
+        // Rank-1: largest magnitude is at index 4 (|-9| = 9 > all others).
+        NDArray v = new ConcreteNDArray(new double[]{1, -3, 2, 5, -9, 4, -6}, new Shape(7));
+        assertEquals(4, Numpy.argmaxAbs(v));
+
+        // Rank-2: row-major flat index. Largest |x| is 7.5 at row 1 col 2.
+        NDArray m = new ConcreteNDArray(
+            new double[]{0.1, -0.2, 0.3, 4.0, -1.0, -7.5, 2.0, 0.0, -0.5},
+            new Shape(3, 3));
+        assertEquals(1 * 3 + 2, Numpy.argmaxAbs(m));
+    }
+
+    @Test
+    public void argmaxAbsTieResolvesToEarliestIndex() {
+        NDArray v = new ConcreteNDArray(new double[]{3.0, -3.0, 3.0}, new Shape(3));
+        assertEquals(0, Numpy.argmaxAbs(v));
+    }
+
+    @Test
+    public void argmaxAbsRejectsEmpty() {
+        NDArray empty = new ConcreteNDArray(new double[0], new Shape(0));
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class, () -> Numpy.argmaxAbs(empty));
+    }
 }

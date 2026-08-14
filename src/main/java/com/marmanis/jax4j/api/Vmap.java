@@ -48,21 +48,33 @@ import java.util.function.Function;
 public class Vmap {
 
     public static Function<NDArray, NDArray> vmap(Function<NDArray, NDArray> fn) {
+        return vmap(fn, 0, 0);
+    }
+
+    /**
+     * One-argument vmap with custom input and output axes.
+     */
+    public static Function<NDArray, NDArray> vmap(Function<NDArray, NDArray> fn, int inAxis, int outAxis) {
         return (batchedArg) -> {
-            Shape batchedShape = batchedArg.shape();
-            if (batchedShape.rank() == 0) {
+            NDArray norm = inAxis > 0 ? moveAxisToFront(batchedArg, inAxis) : batchedArg;
+            boolean batch = inAxis >= 0;
+            Shape batchedShape = norm.shape();
+            if (batch && batchedShape.rank() == 0) {
                 throw new IllegalArgumentException("vmap requires at least a 1-D array with a leading batch dimension");
             }
-            int batchSize = batchedShape.dimensions()[0];
-            Shape exampleShape = new Shape(Arrays.copyOfRange(batchedShape.dimensions(), 1, batchedShape.rank()));
+            int batchSize = batch ? batchedShape.dimensions()[0] : 1;
+            Shape exampleShape = batch
+                ? new Shape(Arrays.copyOfRange(batchedShape.dimensions(), 1, batchedShape.rank()))
+                : batchedShape;
 
             Tracer.start();
-            Var inVar = Tracer.current().nextVar(exampleShape, batchedArg.dtype());
+            Var inVar = Tracer.current().nextVar(exampleShape, norm.dtype());
             NDArray result = fn.apply(new TracedNDArray(inVar));
             Var outVar = ((TracedNDArray) result).getVar();
             Jaxpr jaxpr = Tracer.stop(List.of(inVar), List.of(outVar));
 
-            return runMulti(jaxpr, List.of(batchedArg), List.of(true), batchSize);
+            NDArray out = runMulti(jaxpr, List.of(norm), List.of(batch), batchSize).get(0);
+            return outAxis > 0 ? moveAxisFromFront(out, outAxis) : out;
         };
     }
 
@@ -74,9 +86,6 @@ public class Vmap {
      * jax4j equivalent of Python JAX's {@code None}).  {@code outAxis} is the
      * axis where the batch dimension should appear in the output (0 = leading,
      * 1 = second axis, etc.).
-     *
-     * <p>Axis transposition is limited to 2-D arrays; for higher-rank inputs
-     * use {@code in_axes=0} and pre-transpose manually.
      */
     public static BiFunction<NDArray, NDArray, NDArray> vmap(
             BiFunction<NDArray, NDArray, NDArray> fn,
@@ -104,8 +113,8 @@ public class Vmap {
             Var outVar = ((TracedNDArray) result).getVar();
             Jaxpr jaxpr = Tracer.stop(List.of(v0, v1), List.of(outVar));
 
-            NDArray out = runMulti(jaxpr, List.of(norm0, norm1), List.of(batch0, batch1), batchSize);
-            return outAxis > 0 ? moveAxisToFront(out, outAxis) : out;
+            NDArray out = runMulti(jaxpr, List.of(norm0, norm1), List.of(batch0, batch1), batchSize).get(0);
+            return outAxis > 0 ? moveAxisFromFront(out, outAxis) : out;
         };
     }
 
@@ -115,11 +124,111 @@ public class Vmap {
     }
 
     /**
+     * Tree-vmap transformation: batches leaf values of a PyTree input.
+     * {@code inAxes[i]} specifies the batch axis for the i-th leaf in flatten order,
+     * and {@code outAxes[j]} specifies the target batch axis for the j-th leaf in the output PyTree.
+     */
+    public static Function<com.marmanis.jax4j.pytree.PyTree, com.marmanis.jax4j.pytree.PyTree> vmapTree(
+            Function<com.marmanis.jax4j.pytree.PyTree, com.marmanis.jax4j.pytree.PyTree> fn,
+            int[] inAxes,
+            int[] outAxes) {
+        return (batchedTree) -> {
+            List<NDArray> batchedLeaves = com.marmanis.jax4j.pytree.PyTrees.flatten(batchedTree);
+            List<NDArray> normLeaves = new ArrayList<>();
+            List<Boolean> isBatched = new ArrayList<>();
+            int batchSize = 1;
+
+            for (int i = 0; i < batchedLeaves.size(); i++) {
+                NDArray leaf = batchedLeaves.get(i);
+                if (leaf == null) {
+                    normLeaves.add(null);
+                    isBatched.add(false);
+                } else {
+                    int axis = inAxes[i];
+                    if (axis >= 0) {
+                        NDArray norm = moveAxisToFront(leaf, axis);
+                        normLeaves.add(norm);
+                        isBatched.add(true);
+                        batchSize = norm.shape().dimensions()[0];
+                    } else {
+                        normLeaves.add(leaf);
+                        isBatched.add(false);
+                    }
+                }
+            }
+
+            Tracer.start();
+            List<Var> inVars = new ArrayList<>();
+            Jaxpr jaxpr;
+            List<NDArray> resultLeavesSample;
+            com.marmanis.jax4j.pytree.PyTree resultTree;
+            try {
+                List<NDArray> tracedLeaves = new ArrayList<>();
+                for (int i = 0; i < batchedLeaves.size(); i++) {
+                    NDArray leaf = batchedLeaves.get(i);
+                    if (leaf == null) {
+                        tracedLeaves.add(null);
+                    } else {
+                        Shape exampleShape = isBatched.get(i)
+                            ? new Shape(Arrays.copyOfRange(normLeaves.get(i).shape().dimensions(), 1, normLeaves.get(i).shape().rank()))
+                            : leaf.shape();
+                        Var v = Tracer.current().nextVar(exampleShape, leaf.dtype());
+                        inVars.add(v);
+                        tracedLeaves.add(new TracedNDArray(v));
+                    }
+                }
+                com.marmanis.jax4j.pytree.PyTree tracedTree = com.marmanis.jax4j.pytree.PyTrees.unflatten(batchedTree, tracedLeaves);
+                resultTree = fn.apply(tracedTree);
+                resultLeavesSample = com.marmanis.jax4j.pytree.PyTrees.flatten(resultTree);
+                List<Var> outVars = new ArrayList<>();
+                for (NDArray gl : resultLeavesSample) {
+                    if (gl != null) {
+                        outVars.add(((TracedNDArray) gl).getVar());
+                    }
+                }
+                jaxpr = Tracer.stop(inVars, outVars);
+            } catch (RuntimeException | Error e) {
+                Tracer.abort();
+                throw e;
+            }
+
+            List<NDArray> nonNullNormLeaves = new ArrayList<>();
+            for (NDArray leaf : normLeaves) {
+                if (leaf != null) nonNullNormLeaves.add(leaf);
+            }
+            List<Boolean> nonNullIsBatched = new ArrayList<>();
+            for (int i = 0; i < batchedLeaves.size(); i++) {
+                if (batchedLeaves.get(i) != null) {
+                    nonNullIsBatched.add(isBatched.get(i));
+                }
+            }
+
+            List<NDArray> rawOutputs = runMulti(jaxpr, nonNullNormLeaves, nonNullIsBatched, batchSize);
+
+            List<NDArray> finalLeaves = new ArrayList<>();
+            int rawIdx = 0;
+            int outIdx = 0;
+            for (NDArray gl : resultLeavesSample) {
+                if (gl == null) {
+                    finalLeaves.add(null);
+                } else {
+                    NDArray rawOut = rawOutputs.get(rawIdx++);
+                    int targetAxis = outAxes[outIdx++];
+                    NDArray oriented = targetAxis > 0 ? moveAxisFromFront(rawOut, targetAxis) : rawOut;
+                    finalLeaves.add(oriented);
+                }
+            }
+            return com.marmanis.jax4j.pytree.PyTrees.unflatten(resultTree, finalLeaves);
+        };
+    }
+
+    /**
      * General multi-input run: initialises the value environment with {@code args}
      * marking each as batched or not, then replays every equation through
-     * {@link #applyBatchingRule}.
+     * {@link #applyBatchingRule}. Returns a list of batched outputs corresponding
+     * to the outVars.
      */
-    private static NDArray runMulti(Jaxpr jaxpr, List<NDArray> args, List<Boolean> isBatched, int batchSize) {
+    private static List<NDArray> runMulti(Jaxpr jaxpr, List<NDArray> args, List<Boolean> isBatched, int batchSize) {
         Map<Integer, NDArray> values = new HashMap<>();
         Set<Integer> batched = new HashSet<>();
 
@@ -144,33 +253,55 @@ public class Vmap {
             if (anyBatched) batched.add(eq.outputs().get(0).id());
         }
 
-        Var outVar = jaxpr.outVars().get(0);
-        NDArray out = values.get(outVar.id());
-        if (!batched.contains(outVar.id())) {
-            out = broadcastToBatch(out, batchSize);
+        List<NDArray> outputs = new ArrayList<>();
+        for (Var outVar : jaxpr.outVars()) {
+            NDArray out = values.get(outVar.id());
+            if (!batched.contains(outVar.id())) {
+                out = broadcastToBatch(out, batchSize);
+            }
+            outputs.add(out);
         }
-        return out;
+        return outputs;
     }
 
     /**
-     * Moves {@code axis} to position 0 by transposing. Currently supports
-     * 2-D arrays only; {@code axis=0} is a no-op for any rank.
+     * Moves {@code axis} to position 0 by transposing. Supports arbitrary rank.
      */
     static NDArray moveAxisToFront(NDArray a, int axis) {
         if (axis == 0) return a;
         int rank = a.shape().rank();
-        if (rank == 2 && axis == 1) {
-            int[] dims = a.shape().dimensions();
-            int rows = dims[0], cols = dims[1];
-            float[] src = a.toFloatArray();
-            float[] dst = new float[src.length];
-            for (int i = 0; i < rows; i++)
-                for (int j = 0; j < cols; j++)
-                    dst[j * rows + i] = src[i * cols + j];
-            return new ConcreteNDArray(dst, new Shape(cols, rows));
+        int[] axes = new int[rank];
+        axes[0] = axis;
+        int idx = 1;
+        for (int i = 0; i < rank; i++) {
+            if (i != axis) {
+                axes[idx++] = i;
+            }
         }
-        throw new UnsupportedOperationException(
-            "moveAxisToFront: only axis=0 (any rank) or axis=1 on 2-D arrays is supported; got axis=" + axis + " rank=" + rank);
+        return a.transpose(axes);
+    }
+
+    /**
+     * Moves the front axis (index 0) back to position {@code axis}. Supports arbitrary rank.
+     */
+    static NDArray moveAxisFromFront(NDArray a, int axis) {
+        if (axis == 0) return a;
+        int rank = a.shape().rank();
+        if (axis >= rank) {
+            throw new IllegalArgumentException(
+                "outAxis " + axis + " is out of range for output of rank " + rank
+                + " (produced by a vmapped function that may reduce rank)");
+        }
+        int[] axes = new int[rank];
+        int idx = 0;
+        for (int i = 1; i <= axis; i++) {
+            axes[idx++] = i;
+        }
+        axes[idx++] = 0;
+        for (int i = axis + 1; i < rank; i++) {
+            axes[idx++] = i;
+        }
+        return a.transpose(axes);
     }
 
     /**
@@ -221,13 +352,26 @@ public class Vmap {
             // Generalizes for free: indices' shape can already include a
             // leading batch dim (the eager loop only cares about indices'
             // total element count), so a batched lookup needs no special casing.
-            case GATHER -> Numpy.takeEager(inputs[0], inputs[1]);
+            case GATHER -> {
+                if (batched[0]) {
+                    int B = inputs[0].shape().dimensions()[0];
+                    Shape tableExShape = new Shape(Arrays.copyOfRange(inputs[0].shape().dimensions(), 1, inputs[0].shape().rank()));
+                    List<NDArray> shards = new ArrayList<>(B);
+                    for (int b = 0; b < B; b++) {
+                        NDArray slice = ScanUtil.sliceLeading(inputs[0], b, tableExShape);
+                        shards.add(Numpy.takeEager(slice, inputs[1]));
+                    }
+                    yield ScanUtil.stackLeading(shards);
+                } else {
+                    yield Numpy.takeEager(inputs[0], inputs[1]);
+                }
+            }
             case CHECKPOINT -> {
                 // Inline the checkpoint body into the batched trace by re-interpreting
                 // the sub-Jaxpr through runMulti — equivalent to vmap(fn) where fn is
                 // the checkpointed body (the rematerialization hint is a no-op under vmap).
                 CheckpointMeta m = (CheckpointMeta) metadata;
-                yield runMulti(m.subJaxpr(), List.of(inputs[0]), List.of(batched[0]), batchSize);
+                yield runMulti(m.subJaxpr(), List.of(inputs[0]), List.of(batched[0]), batchSize).get(0);
             }
             case PMAP -> {
                 PmapMeta m = (PmapMeta) metadata;
@@ -249,22 +393,22 @@ public class Vmap {
                 yield ScanUtil.stackLeading(batchResults);
             }
             case RESHAPE -> {
-                // RESHAPE has no metadata; the target shape is derived from the input.
-                // Under vmap, the batched input has a leading batch dim; we must keep it.
-                // The logical per-example target shape is the output shape with leading dim removed.
-                // Since we can't recover the original outShape here (no metadata), we just
-                // reshape to preserve batch size and flatten/unflatten the rest.
-                // Concrete: if in=[B, *in_ex] and target=[*out_ex] then batched target=[B, *out_ex].
-                // The existing applyBatchingRule doesn't have access to eq.outputs() here.
-                // Simple heuristic: batched reshape = reshape keeping leading dim.
-                if (!batched[0]) {
-                    // Not batched — use input shape as-is (shouldn't happen in normal vmap flow)
-                    yield inputs[0];
+                if (metadata instanceof Shape targetExShape) {
+                    if (batched[0]) {
+                        int b = inputs[0].shape().dimensions()[0];
+                        yield inputs[0].reshape(ScanUtil.prependDim(targetExShape, b));
+                    } else {
+                        yield inputs[0].reshape(targetExShape);
+                    }
+                } else {
+                    if (batched[0]) {
+                        int b = inputs[0].shape().dimensions()[0];
+                        long innerSize = inputs[0].shape().size() / b;
+                        yield inputs[0].reshape(new Shape(b, (int) innerSize));
+                    } else {
+                        yield inputs[0];
+                    }
                 }
-                // The batch dim is inputs[0].shape().dimensions()[0]; inner size is unchanged.
-                int b = inputs[0].shape().dimensions()[0];
-                long innerSize = inputs[0].shape().size() / b;
-                yield inputs[0].reshape(new Shape(b, (int) innerSize));
             }
             case TRANSPOSE -> {
                 TransposeMeta m = (TransposeMeta) metadata;
@@ -325,6 +469,14 @@ public class Vmap {
      * batched array to a single scalar.
      */
     private static NDArray batchedReduce(NDArray batchedArray, int batchSize, boolean mean) {
+        if (Tracer.current() != null) {
+            NDArray res = batchedArray;
+            int rank = res.shape().rank();
+            for (int axis = rank - 1; axis >= 1; axis--) {
+                res = mean ? res.mean(axis, false) : res.sum(axis, false);
+            }
+            return res;
+        }
         float[] data = batchedArray.toFloatArray();
         int perExample = data.length / batchSize;
         float[] out = new float[batchSize];
@@ -349,6 +501,35 @@ public class Vmap {
         int M = aDims[0];
         int K = aDims[1];
         int N = bDims[1];
+
+        if (Tracer.current() != null) {
+            List<NDArray> results = new ArrayList<>(batchSize);
+            NDArray aReshaped = aBatched ? a.reshape(new Shape(batchSize, M * K)) : null;
+            NDArray bReshaped = bBatched ? b.reshape(new Shape(batchSize, K * N)) : null;
+
+            for (int batch = 0; batch < batchSize; batch++) {
+                NDArray aSlice;
+                if (aBatched) {
+                    aSlice = Numpy.take(aReshaped, new ConcreteNDArray(new int[]{batch}, new Shape(1)))
+                                   .reshape(new Shape(M, K));
+                } else {
+                    aSlice = a;
+                }
+
+                NDArray bSlice;
+                if (bBatched) {
+                    bSlice = Numpy.take(bReshaped, new ConcreteNDArray(new int[]{batch}, new Shape(1)))
+                                   .reshape(new Shape(K, N));
+                } else {
+                    bSlice = b;
+                }
+
+                NDArray dotVal = aSlice.dot(bSlice);
+                results.add(dotVal.reshape(new Shape(1, M * N)));
+            }
+            NDArray concatenated = Numpy.concatenate(results, 0);
+            return concatenated.reshape(new Shape(batchSize, M, N));
+        }
 
         float[] aData = a.toFloatArray();
         float[] bData = b.toFloatArray();

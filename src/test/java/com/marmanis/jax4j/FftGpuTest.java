@@ -164,6 +164,50 @@ public class FftGpuTest {
     }
 
     /**
+     * Auto-dispatch (the Kuramoto–Sivashinsky scenario): {@link Fft#fft} /
+     * {@link Fft#ifft} on <em>host-resident</em> 1-D inputs must offload to the
+     * GPU by falling back to the default device — the 1-D-FFT examples keep
+     * their state as host NDArrays, so this is what actually lets them run on
+     * cuFFT. Asserts the result lands on a GPU device and that a forward∘inverse
+     * round-trip recovers the input.
+     */
+    @Test
+    public void autoDispatchFft1DFromHostRoutesToGpu() {
+        Device dev = gpuDeviceOrSkip();
+        int n = 256;
+        Random rng = new Random(0x5A1DL);
+        double[] hre = new double[n];
+        double[] him = new double[n];
+        for (int i = 0; i < n; i++) {
+            hre[i] = rng.nextDouble() * 2 - 1;
+            him[i] = rng.nextDouble() * 2 - 1;
+        }
+
+        // Host inputs (no device placement) — must still auto-offload.
+        NDArray[] fwd = Fft.fft(f64Host(hre), f64Host(him));
+        assertOnGpu(fwd[0], "auto-dispatch fft from host");
+
+        NDArray[] back = Fft.ifft(fwd[0], fwd[1]);
+        assertOnGpu(back[0], "auto-dispatch ifft");
+        double[] rR = back[0].toDoubleArray(), rI = back[1].toDoubleArray();
+        for (int i = 0; i < n; i++) {
+            if (Math.abs(rR[i] - hre[i]) > TOL_F64 || Math.abs(rI[i] - him[i]) > TOL_F64) {
+                throw new AssertionError(
+                    "round-trip bin " + i + ": got (" + rR[i] + "," + rI[i] +
+                    ") expected (" + hre[i] + "," + him[i] + ")");
+            }
+        }
+    }
+
+    private static void assertOnGpu(NDArray a, String label) {
+        Device d = a.device();
+        TornadoDevice td = (d == null) ? null : d.getTornadoDevice();
+        if (td == null || td.getDeviceType() != TornadoDeviceType.GPU) {
+            throw new AssertionError(label + " did not land on a GPU device (was " + d + ")");
+        }
+    }
+
+    /**
      * Smoke perf: a length-{@code 2^16} complex FP32 FFT should complete on
      * the GPU in under two seconds end-to-end (transfer + dispatch + copy
      * back). Not a strict benchmark — the assertion is loose enough that

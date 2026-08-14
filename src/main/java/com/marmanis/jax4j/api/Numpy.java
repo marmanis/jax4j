@@ -79,6 +79,33 @@ public final class Numpy {
         return new ConcreteNDArray(out, appendDim(indices.shape(), dim));
     }
 
+    /**
+     * Flat index of the largest-magnitude element of {@code x}, i.e.
+     * {@code argmax(|x|)} treating the array as a flat sequence in row-major
+     * order. Ties resolve to the earliest index. Not differentiable — this
+     * is an index-returning reduction, treated as a constant zero cotangent
+     * if it appears inside a differentiated function.
+     *
+     * <p>Companion to {@code jax.numpy.argmax(jnp.abs(x))}; provided as one
+     * primitive because that idiom appears in tight inner loops (chebfun4j's
+     * Chebfun2 ACA peak-search picks the max-abs residual entry each
+     * iteration) and building it from two passes over the data wastes both
+     * time and an intermediate buffer.
+     */
+    public static int argmaxAbs(NDArray x) {
+        double[] data = x.toDoubleArray();
+        if (data.length == 0) {
+            throw new IllegalArgumentException("argmaxAbs: empty array");
+        }
+        int bestIdx = 0;
+        double bestVal = Math.abs(data[0]);
+        for (int i = 1; i < data.length; i++) {
+            double a = Math.abs(data[i]);
+            if (a > bestVal) { bestVal = a; bestIdx = i; }
+        }
+        return bestIdx;
+    }
+
     private static Shape appendDim(Shape shape, int n) {
         int[] dims = shape.dimensions();
         int[] out = new int[dims.length + 1];

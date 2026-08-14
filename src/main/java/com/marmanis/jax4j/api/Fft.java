@@ -199,10 +199,12 @@ public final class Fft {
      * arithmetic; we discard the small rounding residual and keep the reals).
      */
     public static NDArray dctI(NDArray x) {
-        if (x.shape().rank() != 1) {
-            throw new IllegalArgumentException("dctI requires a 1-D input, got shape " + x.shape());
+        int rank = x.shape().rank();
+        if (rank != 1 && rank != 2) {
+            throw new IllegalArgumentException(
+                "dctI requires a 1-D or 2-D input, got shape " + x.shape());
         }
-        int n = x.shape().dimensions()[0];
+        int n = x.shape().dimensions()[rank - 1];  // transform axis is the last
         if (n == 1) return x;
         if (n < 2) throw new IllegalArgumentException("dctI requires length >= 1, got " + n);
         int m = n - 1;
@@ -210,13 +212,40 @@ public final class Fft {
             throw new IllegalArgumentException(
                 "dctI requires (N - 1) to be a power of two, got N = " + n);
         }
-        if (x.dtype() == DType.FLOAT64) {
-            return new ConcreteNDArray(dctIDouble(x.toDoubleArray()), new Shape(n));
+        if (x.dtype() != DType.FLOAT64 && x.dtype() != DType.FLOAT32) {
+            throw new IllegalArgumentException(
+                "dctI requires FLOAT32 or FLOAT64 input, got " + x.dtype());
         }
-        if (x.dtype() == DType.FLOAT32) {
+        if (rank == 1) {
+            if (x.dtype() == DType.FLOAT64) {
+                return new ConcreteNDArray(dctIDouble(x.toDoubleArray()), new Shape(n));
+            }
             return new ConcreteNDArray(dctIFloat(x.toFloatArray()), new Shape(n));
         }
-        throw new IllegalArgumentException("dctI requires FLOAT32 or FLOAT64 input, got " + x.dtype());
+        // Rank-2: transform each row independently. Batched API surface — a
+        // future cuFFT path can replace the per-row loop with one dispatch
+        // without a caller-visible change.
+        int batch = x.shape().dimensions()[0];
+        if (x.dtype() == DType.FLOAT64) {
+            double[] in = x.toDoubleArray();
+            double[] out = new double[batch * n];
+            double[] row = new double[n];
+            for (int b = 0; b < batch; b++) {
+                System.arraycopy(in, b * n, row, 0, n);
+                double[] y = dctIDouble(row);
+                System.arraycopy(y, 0, out, b * n, n);
+            }
+            return new ConcreteNDArray(out, new Shape(batch, n));
+        }
+        float[] in = x.toFloatArray();
+        float[] out = new float[batch * n];
+        float[] row = new float[n];
+        for (int b = 0; b < batch; b++) {
+            System.arraycopy(in, b * n, row, 0, n);
+            float[] y = dctIFloat(row);
+            System.arraycopy(y, 0, out, b * n, n);
+        }
+        return new ConcreteNDArray(out, new Shape(batch, n));
     }
 
     /**
@@ -245,6 +274,33 @@ public final class Fft {
                 "dctIRaw requires (N - 1) to be a power of two, got N = " + n);
         }
         return dctIDouble(x);
+    }
+
+    /**
+     * Batched raw-{@code double[][]} DCT-I: applies {@link #dctIRaw(double[])}
+     * to each row independently and returns a fresh {@code double[][]} of the
+     * same shape. Rows must share a length {@code N} that is {@code 1} or of
+     * the form {@code 2^k + 1}. Zero-row input returns an empty array.
+     *
+     * <p>Same use case as {@link #dctIRaw(double[])} — a tight host-side
+     * loop that would otherwise pay {@code NDArray}/{@code Shape} allocation
+     * per row — extended to the batched shape chebfun4j's Chebfun2 ACA
+     * assembly needs when it wraps every extracted column/row of the low-
+     * rank factorisation as a Chebtech at once.
+     */
+    public static double[][] dctIRaw(double[][] x) {
+        if (x.length == 0) return new double[0][];
+        int n = x[0].length;
+        for (int b = 1; b < x.length; b++) {
+            if (x[b].length != n) {
+                throw new IllegalArgumentException(
+                    "dctIRaw batched: rows must share a length; row 0 is " + n +
+                    ", row " + b + " is " + x[b].length);
+            }
+        }
+        double[][] out = new double[x.length][];
+        for (int b = 0; b < x.length; b++) out[b] = dctIRaw(x[b]);
+        return out;
     }
 
     private static NDArray[] complexTransform(NDArray re, NDArray im, boolean inverse) {
@@ -652,13 +708,195 @@ public final class Fft {
     }
 
     /**
-     * Try to dispatch fft2/ifft2 to GPU via cuFFT.
-     * Currently returns null (falls back to CPU) — GPU dispatch for 2-D is
-     * deferred until a cufftDispatch2D helper is implemented.
+     * Try to dispatch fft2/ifft2 to GPU via cuFFT. Returns {@code null} to take
+     * the CPU fallback when cuFFT is unavailable (module absent — the common,
+     * non-TornadoVM case), the dtype/shape is unsupported, or no accelerator is
+     * present. When the module is available and the inputs are host-resident,
+     * the transform is run on {@link Device#defaultDevice()} (a GPU when one was
+     * discovered), so ordinary {@code fft2}/{@code ifft2} calls offload under
+     * TornadoVM without the caller having to place data on a device first.
      */
     private static NDArray[] tryCuFft2(NDArray re, NDArray im, boolean inverse) {
-        // GPU 2-D dispatch not yet implemented; fall through to CPU path.
-        return null;
+        if (!cufftAvailable()) return null;
+        if (re.shape().rank() != 2 || im.shape().rank() != 2) return null;
+        if (!re.shape().equals(im.shape())) return null;
+        if (re.dtype() != im.dtype()) return null;
+        int[] d = re.shape().dimensions();
+        int n0 = d[0], n1 = d[1];
+        if (n0 < 2 || n1 < 2 || (n0 & (n0 - 1)) != 0 || (n1 & (n1 - 1)) != 0) return null;
+
+        Device dev = re.device();
+        if (dev == null || dev == Device.host()) {
+            dev = Device.defaultDevice();
+        }
+        if (dev == null || dev == Device.host() || dev.getTornadoDevice() == null) return null;
+
+        try {
+            return switch (re.dtype()) {
+                case FLOAT32 -> cufftDispatch2DF32(re, im, dev, n0, n1, inverse);
+                case FLOAT64 -> cufftDispatch2DF64(re, im, dev, n0, n1, inverse);
+                default -> null;
+            };
+        } catch (Throwable t) {
+            handleDispatchFailure("fft2 (2D)", t);
+            return null;
+        }
+    }
+
+    /**
+     * Explicit 2-D cuFFT entry point (no host fallback). Both inputs must be
+     * 2-D, same shape, power-of-two dimensions; the transform runs on
+     * {@code re.device()} when non-host, else on {@link Device#defaultDevice()}.
+     */
+    public static NDArray[] fft2OnDevice(NDArray re, NDArray im, boolean inverse) {
+        if (!cufftAvailable()) {
+            throw new IllegalStateException("cuFFT not available (tornado.cufft module not on the boot layer)");
+        }
+        int[] d = re.shape().dimensions();
+        if (re.shape().rank() != 2) throw new IllegalArgumentException("fft2OnDevice requires a 2-D input");
+        int n0 = d[0], n1 = d[1];
+        Device dev = re.device();
+        if (dev == null || dev == Device.host()) dev = Device.defaultDevice();
+        if (dev == null || dev == Device.host()) {
+            throw new IllegalStateException("fft2OnDevice requires a non-host Device");
+        }
+        return switch (re.dtype()) {
+            case FLOAT32 -> cufftDispatch2DF32(re, im, dev, n0, n1, inverse);
+            case FLOAT64 -> cufftDispatch2DF64(re, im, dev, n0, n1, inverse);
+            default -> throw new IllegalArgumentException(
+                "fft2OnDevice requires FLOAT32 or FLOAT64 inputs, got " + re.dtype());
+        };
+    }
+
+    // ================================================================
+    //  2-D cuFFT bridge — device-resident, batched, single cached plan.
+    //  A 2-D transform is a batched 1-D cuFFT along the contiguous axis,
+    //  a transpose, another batched 1-D cuFFT, and a transpose back —
+    //  the same strategy the 3-D bridge uses, kept in one TaskGraph with
+    //  two ping-pong buffers so the data stays device-resident and cuFFT's
+    //  (un-reclaimed) workspace is created once per shape, not per call.
+    // ================================================================
+
+    /** Transpose an interleaved complex (rows x cols) grid into (cols x rows). */
+    public static void transpose2DF32(FloatArray in, FloatArray out, int rows, int cols) {
+        for (@Parallel int i = 0; i < rows; i++) {
+            for (@Parallel int j = 0; j < cols; j++) {
+                int inIdx = 2 * (i * cols + j);
+                int outIdx = 2 * (j * rows + i);
+                out.set(outIdx, in.get(inIdx));
+                out.set(outIdx + 1, in.get(inIdx + 1));
+            }
+        }
+    }
+
+    public static void transpose2DF64(DoubleArray in, DoubleArray out, int rows, int cols) {
+        for (@Parallel int i = 0; i < rows; i++) {
+            for (@Parallel int j = 0; j < cols; j++) {
+                int inIdx = 2 * (i * cols + j);
+                int outIdx = 2 * (j * rows + i);
+                out.set(outIdx, in.get(inIdx));
+                out.set(outIdx + 1, in.get(inIdx + 1));
+            }
+        }
+    }
+
+    private record Plan2F32(FloatArray bufA, FloatArray bufB, TornadoExecutionPlan plan) {}
+    private record Plan2F64(DoubleArray bufA, DoubleArray bufB, TornadoExecutionPlan plan) {}
+    private static final ConcurrentHashMap<String, Plan2F32> plan2F32Cache = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Plan2F64> plan2F64Cache = new ConcurrentHashMap<>();
+
+    private static String planKey2(int n0, int n1, boolean inverse, Device dev) {
+        return n0 + "x" + n1 + "-" + (inverse ? "inv" : "fwd") + "-" + System.identityHashCode(dev);
+    }
+
+    private static Plan2F32 acquire2DF32(int n0, int n1, boolean inverse, Device dev) {
+        return plan2F32Cache.computeIfAbsent(planKey2(n0, n1, inverse, dev), k -> {
+            int total = n0 * n1;
+            FloatArray a = new FloatArray(2 * total);
+            FloatArray b = new FloatArray(2 * total);
+            TornadoFunctions.LibraryTask4<FloatArray, FloatArray, Integer, Integer> lp = cufftC2C(inverse);
+            TaskGraph g = new TaskGraph("jax4j-fft2-f32-" + k)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a)
+                .libraryTask("c2c-1", lp, a, b, n1, n0)            // FFT along contiguous axis (size n1, batch n0)
+                .task("t-1", Fft::transpose2DF32, b, a, n0, n1)    // (n0,n1) -> (n1,n0)
+                .libraryTask("c2c-0", lp, a, b, n0, n1)            // FFT along (now contiguous) axis (size n0, batch n1)
+                .task("t-2", Fft::transpose2DF32, b, a, n1, n0)    // (n1,n0) -> (n0,n1)
+                .transferToHost(DataTransferMode.EVERY_EXECUTION, a);
+            TornadoExecutionPlan p = new TornadoExecutionPlan(g.snapshot())
+                .withDevice(dev.getTornadoDevice());
+            return new Plan2F32(a, b, p);
+        });
+    }
+
+    private static Plan2F64 acquire2DF64(int n0, int n1, boolean inverse, Device dev) {
+        return plan2F64Cache.computeIfAbsent(planKey2(n0, n1, inverse, dev), k -> {
+            int total = n0 * n1;
+            DoubleArray a = new DoubleArray(2 * total);
+            DoubleArray b = new DoubleArray(2 * total);
+            TornadoFunctions.LibraryTask4<DoubleArray, DoubleArray, Integer, Integer> lp = cufftZ2Z(inverse);
+            TaskGraph g = new TaskGraph("jax4j-fft2-f64-" + k)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, a)
+                .libraryTask("z2z-1", lp, a, b, n1, n0)
+                .task("t-1", Fft::transpose2DF64, b, a, n0, n1)
+                .libraryTask("z2z-0", lp, a, b, n0, n1)
+                .task("t-2", Fft::transpose2DF64, b, a, n1, n0)
+                .transferToHost(DataTransferMode.EVERY_EXECUTION, a);
+            TornadoExecutionPlan p = new TornadoExecutionPlan(g.snapshot())
+                .withDevice(dev.getTornadoDevice());
+            return new Plan2F64(a, b, p);
+        });
+    }
+
+    private static NDArray[] cufftDispatch2DF32(
+            NDArray re, NDArray im, Device dev, int n0, int n1, boolean inverse) {
+        float[] hre = re.toFloatArray();
+        float[] him = im.toFloatArray();
+        int total = n0 * n1;
+        Plan2F32 pp = acquire2DF32(n0, n1, inverse, dev);
+        FloatArray bufA = pp.bufA();
+        for (int i = 0; i < total; i++) {
+            bufA.set(2 * i, hre[i]);
+            bufA.set(2 * i + 1, him[i]);
+        }
+        execPlan(pp.plan(), "cuFFT F32 2-D dispatch failed");
+        float[] outRe = new float[total];
+        float[] outIm = new float[total];
+        float scale = inverse ? 1f / total : 1f;
+        for (int i = 0; i < total; i++) {
+            outRe[i] = bufA.get(2 * i) * scale;
+            outIm[i] = bufA.get(2 * i + 1) * scale;
+        }
+        Shape sh = re.shape();
+        return new NDArray[] {
+            new ConcreteNDArray(outRe, sh, DType.FLOAT32, dev),
+            new ConcreteNDArray(outIm, sh, DType.FLOAT32, dev)
+        };
+    }
+
+    private static NDArray[] cufftDispatch2DF64(
+            NDArray re, NDArray im, Device dev, int n0, int n1, boolean inverse) {
+        double[] hre = re.toDoubleArray();
+        double[] him = im.toDoubleArray();
+        int total = n0 * n1;
+        Plan2F64 pp = acquire2DF64(n0, n1, inverse, dev);
+        DoubleArray bufA = pp.bufA();
+        for (int i = 0; i < total; i++) {
+            bufA.set(2 * i, hre[i]);
+            bufA.set(2 * i + 1, him[i]);
+        }
+        execPlan(pp.plan(), "cuFFT F64 2-D dispatch failed");
+        double[] outRe = new double[total];
+        double[] outIm = new double[total];
+        double scale = inverse ? 1.0 / total : 1.0;
+        for (int i = 0; i < total; i++) {
+            outRe[i] = bufA.get(2 * i) * scale;
+            outIm[i] = bufA.get(2 * i + 1) * scale;
+        }
+        Shape sh = re.shape();
+        return new NDArray[] {
+            new ConcreteNDArray(outRe, sh, dev),
+            new ConcreteNDArray(outIm, sh, dev)
+        };
     }
 
     /**
@@ -1045,13 +1283,21 @@ public final class Fft {
      */
     private static NDArray[] tryCuFft(NDArray re, NDArray im, boolean inverse) {
         if (!cufftAvailable()) return null;
-        Device dev = re.device();
-        if (dev == null || dev == Device.host()) return null;
-        if (!dev.equals(im.device())) return null;
         if (re.dtype() != im.dtype()) return null;
         if (re.shape().rank() != 1 || im.shape().rank() != 1) return null;
+        if (!re.shape().equals(im.shape())) return null;
         int n = re.shape().dimensions()[0];
         if (n < 2 || (n & (n - 1)) != 0) return null;
+
+        // Auto-offload host arrays (e.g. the Kuramoto-Sivashinsky example) by
+        // falling back to the default GPU device, mirroring tryCuFft2. The
+        // dispatch reads host data via toFloatArray/toDoubleArray, so the
+        // inputs need not already be device-resident.
+        Device dev = re.device();
+        if (dev == null || dev == Device.host()) {
+            dev = Device.defaultDevice();
+        }
+        if (dev == null || dev == Device.host() || dev.getTornadoDevice() == null) return null;
         try {
             return switch (re.dtype()) {
                 case FLOAT32 -> cufftDispatchF32(re, im, dev, n, inverse);

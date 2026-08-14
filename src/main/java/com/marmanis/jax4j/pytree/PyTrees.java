@@ -80,7 +80,7 @@ public final class PyTrees {
      */
     public static PyTree map(Function<NDArray, NDArray> fn, PyTree tree) {
         return switch (tree) {
-            case PyTree.Leaf(var value)        -> new PyTree.Leaf(fn.apply(value));
+            case PyTree.Leaf(var value)        -> new PyTree.Leaf(value == null ? null : fn.apply(value));
             case PyTree.ListNode(var children)  -> new PyTree.ListNode(children.stream().map(c -> map(fn, c)).toList());
             case PyTree.MapNode(var childMap)   -> {
                 Map<String, PyTree> result = new LinkedHashMap<>();
@@ -101,7 +101,17 @@ public final class PyTrees {
             throw new IllegalArgumentException("Tree structures do not match: " + aLeaves.size() + " vs " + bLeaves.size() + " leaves");
         }
         List<NDArray> combined = new ArrayList<>();
-        for (int i = 0; i < aLeaves.size(); i++) combined.add(fn.apply(aLeaves.get(i), bLeaves.get(i)));
+        for (int i = 0; i < aLeaves.size(); i++) {
+            NDArray valA = aLeaves.get(i);
+            NDArray valB = bLeaves.get(i);
+            if (valB == null) {
+                combined.add(valA);
+            } else if (valA == null) {
+                combined.add(valB);
+            } else {
+                combined.add(fn.apply(valA, valB));
+            }
+        }
         return unflatten(a, combined);
     }
 }

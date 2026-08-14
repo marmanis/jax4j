@@ -149,7 +149,7 @@ public class TracedNDArray implements NDArray {
 
     @Override
     public NDArray reshape(Shape newShape) {
-        return applyPrimitive(Primitive.RESHAPE, List.of(this), newShape);
+        return applyPrimitive(Primitive.RESHAPE, List.of(this), newShape, dtype(), newShape);
     }
 
     @Override

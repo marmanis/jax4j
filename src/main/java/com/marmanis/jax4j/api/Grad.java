@@ -1,9 +1,11 @@
 package com.marmanis.jax4j.api;
 
+import com.marmanis.jax4j.core.Device;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.ConcreteNDArray;
 import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.Shape;
+import java.util.Arrays;
 import com.marmanis.jax4j.api.Fft;
 import com.marmanis.jax4j.api.Linalg;
 import com.marmanis.jax4j.ir.AxisMeta;
@@ -87,13 +89,17 @@ public class Grad {
 
             Tracer.start();
             Jaxpr jaxpr;
+            List<Var> inVars = new ArrayList<>();
             try {
-                List<Var> inVars = new ArrayList<>();
                 List<NDArray> tracedLeaves = new ArrayList<>();
                 for (NDArray leaf : leaves) {
-                    Var v = Tracer.current().nextVar(leaf.shape(), leaf.dtype());
-                    inVars.add(v);
-                    tracedLeaves.add(new TracedNDArray(v));
+                    if (leaf == null) {
+                        tracedLeaves.add(null);
+                    } else {
+                        Var v = Tracer.current().nextVar(leaf.shape(), leaf.dtype());
+                        inVars.add(v);
+                        tracedLeaves.add(new TracedNDArray(v));
+                    }
                 }
                 PyTree tracedTree = PyTrees.unflatten(paramsTree, tracedLeaves);
                 NDArray result = fn.apply(tracedTree);
@@ -104,7 +110,21 @@ public class Grad {
                 throw e;
             }
 
-            List<NDArray> grads = backward(jaxpr, leaves);
+            List<NDArray> nonNullLeaves = new ArrayList<>();
+            for (NDArray leaf : leaves) {
+                if (leaf != null) nonNullLeaves.add(leaf);
+            }
+            List<NDArray> rawGrads = backward(jaxpr, nonNullLeaves);
+
+            List<NDArray> grads = new ArrayList<>();
+            int gradsIdx = 0;
+            for (NDArray leaf : leaves) {
+                if (leaf == null) {
+                    grads.add(null);
+                } else {
+                    grads.add(rawGrads.get(gradsIdx++));
+                }
+            }
             return PyTrees.unflatten(paramsTree, grads);
         };
     }
@@ -117,17 +137,18 @@ public class Grad {
     public static Function<NDArray, NDArray[]> value_and_grad(Function<NDArray, NDArray> fn) {
         return (arg) -> {
             Jaxpr jaxpr = JAX.make_jaxpr(fn, arg);
-            Map<Integer, NDArray> fwdValues = fillForwardValues(jaxpr, List.of(arg));
+            Map<Integer, NDArray> fwdValues = fillForwardValues(jaxpr, List.of(arg), null);
             NDArray value = fwdValues.get(jaxpr.outVars().get(0).id());
             NDArray seed = ones(value.shape(), floatDtypeOrDefault(value.dtype()));
-            List<NDArray> grads = doBackward(jaxpr, fwdValues, List.of(seed));
+            List<NDArray> grads = doBackward(jaxpr, fwdValues, List.of(seed), null);
             return new NDArray[]{value, grads.get(0)};
         };
     }
 
     private static List<NDArray> backward(Jaxpr jaxpr, List<NDArray> argValues) {
         Var outVar = jaxpr.outVars().get(0);
-        NDArray seed = ones(outVar.shape(), floatDtypeOrDefault(outVar.dtype()));
+        Device targetDevice = argValues.isEmpty() ? Device.defaultDevice() : argValues.get(0).device();
+        NDArray seed = ones(outVar.shape(), floatDtypeOrDefault(outVar.dtype())).to(targetDevice);
         return backwardInterpret(jaxpr, argValues, List.of(seed));
     }
 
@@ -140,7 +161,11 @@ public class Grad {
      * behind {@link JAX#jit}'s cached trace hits.
      */
     public static List<NDArray> forwardInterpret(Jaxpr jaxpr, List<NDArray> argValues) {
-        Map<Integer, NDArray> values = fillForwardValues(jaxpr, argValues);
+        return forwardInterpret(jaxpr, argValues, null);
+    }
+
+    public static List<NDArray> forwardInterpret(Jaxpr jaxpr, List<NDArray> argValues, Map<Integer, NDArray> parentValues) {
+        Map<Integer, NDArray> values = fillForwardValues(jaxpr, argValues, parentValues);
         return jaxpr.outVars().stream().map(v -> values.get(v.id())).toList();
     }
 
@@ -155,10 +180,15 @@ public class Grad {
      * gradient trace.
      */
     public static List<NDArray> backwardInterpret(Jaxpr jaxpr, List<NDArray> argValues, List<NDArray> seedGrads) {
-        return doBackward(jaxpr, fillForwardValues(jaxpr, argValues), seedGrads);
+        return backwardInterpret(jaxpr, argValues, seedGrads, null);
     }
 
-    private static List<NDArray> doBackward(Jaxpr jaxpr, Map<Integer, NDArray> values, List<NDArray> seedGrads) {
+    public static List<NDArray> backwardInterpret(Jaxpr jaxpr, List<NDArray> argValues, List<NDArray> seedGrads, Map<Integer, NDArray> parentValues) {
+        Map<Integer, NDArray> values = fillForwardValues(jaxpr, argValues, parentValues);
+        return doBackward(jaxpr, values, seedGrads, parentValues);
+    }
+
+    private static List<NDArray> doBackward(Jaxpr jaxpr, Map<Integer, NDArray> values, List<NDArray> seedGrads, Map<Integer, NDArray> parentValues) {
         Map<Integer, NDArray> grads = new HashMap<>();
         for (int i = 0; i < jaxpr.outVars().size(); i++) {
             grads.merge(jaxpr.outVars().get(i).id(), seedGrads.get(i), NDArray::add);
@@ -173,7 +203,7 @@ public class Grad {
                 NDArray gCarryOut = grads.get(eq.outputs().get(0).id());
                 NDArray gYsOut = grads.get(eq.outputs().get(1).id());
                 if (gCarryOut == null && gYsOut == null) continue;
-                List<NDArray> gIns = scanBackward(eq, inputs, gCarryOut, gYsOut);
+                List<NDArray> gIns = scanBackward(eq, inputs, gCarryOut, gYsOut, values);
                 grads.merge(eq.inputs().get(0).id(), gIns.get(0), NDArray::add);
                 grads.merge(eq.inputs().get(1).id(), gIns.get(1), NDArray::add);
                 continue;
@@ -182,23 +212,36 @@ public class Grad {
             NDArray gOut = grads.get(eq.outputs().get(0).id());
             if (gOut == null) continue;
 
-            List<NDArray> gIns = computeVJPs(eq.primitive(), eq, gOut, inputs);
+            List<NDArray> gIns = computeVJPs(eq.primitive(), eq, gOut, inputs, values);
             for (int j = 0; j < eq.inputs().size(); j++) {
                 grads.merge(eq.inputs().get(j).id(), gIns.get(j), NDArray::add);
             }
         }
 
         List<NDArray> result = new ArrayList<>();
-        for (Var inVar : jaxpr.inVars()) {
-            result.add(grads.getOrDefault(inVar.id(), zeros(inVar.shape(), floatDtypeOrDefault(inVar.dtype()))));
+        for (int j = 0; j < jaxpr.inVars().size(); j++) {
+            Var inVar = jaxpr.inVars().get(j);
+            NDArray g = grads.get(inVar.id());
+            if (g == null) {
+                NDArray inputVal = values.get(inVar.id());
+                Device dev = (inputVal != null) ? inputVal.device() : Device.defaultDevice();
+                g = zeros(inVar.shape(), floatDtypeOrDefault(inVar.dtype())).to(dev);
+            }
+            result.add(g);
         }
         return result;
     }
 
     /** The forward pass shared by {@link #forwardInterpret} and {@link #backwardInterpret}. */
-    private static Map<Integer, NDArray> fillForwardValues(Jaxpr jaxpr, List<NDArray> argValues) {
+    private static Map<Integer, NDArray> fillForwardValues(Jaxpr jaxpr, List<NDArray> argValues, Map<Integer, NDArray> parentValues) {
+        Device targetDevice = argValues.isEmpty() ? Device.defaultDevice() : argValues.get(0).device();
         Map<Integer, NDArray> values = new HashMap<>();
-        values.putAll(jaxpr.consts());
+        if (parentValues != null) {
+            values.putAll(parentValues);
+        }
+        for (Map.Entry<Integer, NDArray> entry : jaxpr.consts().entrySet()) {
+            values.put(entry.getKey(), entry.getValue().to(targetDevice));
+        }
         for (int i = 0; i < jaxpr.inVars().size(); i++) {
             values.put(jaxpr.inVars().get(i).id(), argValues.get(i));
         }
@@ -206,11 +249,11 @@ public class Grad {
         for (Equation eq : jaxpr.equations()) {
             NDArray[] inputs = eq.inputs().stream().map(v -> values.get(v.id())).toArray(NDArray[]::new);
             if (eq.primitive() == Primitive.SCAN) {
-                List<NDArray> outs = scanForward(eq, inputs);
+                List<NDArray> outs = scanForward(eq, inputs, values);
                 values.put(eq.outputs().get(0).id(), outs.get(0));
                 values.put(eq.outputs().get(1).id(), outs.get(1));
             } else {
-                NDArray out = executePrimitive(eq.primitive(), eq, inputs);
+                NDArray out = executePrimitive(eq.primitive(), eq, inputs, values);
                 values.put(eq.outputs().get(0).id(), out);
             }
         }
@@ -218,7 +261,7 @@ public class Grad {
     }
 
     /** Runs a {@code SCAN} equation's step function once per leading-axis slice of {@code xs}. */
-    private static List<NDArray> scanForward(Equation eq, NDArray[] inputs) {
+    private static List<NDArray> scanForward(Equation eq, NDArray[] inputs, Map<Integer, NDArray> parentValues) {
         ScanMeta m = (ScanMeta) eq.metadata();
         NDArray carry = inputs[0];
         NDArray xs = inputs[1];
@@ -228,7 +271,7 @@ public class Grad {
         List<NDArray> ys = new ArrayList<>(steps);
         for (int t = 0; t < steps; t++) {
             NDArray xt = ScanUtil.sliceLeading(xs, t, xStepShape);
-            List<NDArray> stepOut = forwardInterpret(m.stepFn(), List.of(carry, xt));
+            List<NDArray> stepOut = forwardInterpret(m.stepFn(), List.of(carry, xt), parentValues);
             carry = stepOut.get(0);
             ys.add(stepOut.get(1));
         }
@@ -243,7 +286,7 @@ public class Grad {
      * gYsOut} as the two seed gradients (mirrors how JAX differentiates
      * {@code lax.scan} via an internal reverse scan).
      */
-    private static List<NDArray> scanBackward(Equation eq, NDArray[] inputs, NDArray gCarryFinal, NDArray gYsStacked) {
+    private static List<NDArray> scanBackward(Equation eq, NDArray[] inputs, NDArray gCarryFinal, NDArray gYsStacked, Map<Integer, NDArray> parentValues) {
         ScanMeta m = (ScanMeta) eq.metadata();
         NDArray initCarry = inputs[0];
         NDArray xs = inputs[1];
@@ -257,14 +300,14 @@ public class Grad {
         for (int t = 0; t < steps; t++) {
             carryIn[t] = carry;
             xIn[t] = ScanUtil.sliceLeading(xs, t, xStepShape);
-            carry = forwardInterpret(m.stepFn(), List.of(carry, xIn[t])).get(0);
+            carry = forwardInterpret(m.stepFn(), List.of(carry, xIn[t]), parentValues).get(0);
         }
 
-        NDArray gCarry = gCarryFinal != null ? gCarryFinal : zeros(initCarry.shape());
+        NDArray gCarry = gCarryFinal != null ? gCarryFinal : zeros(initCarry.shape()).to(initCarry.device());
         NDArray[] gXs = new NDArray[steps];
         for (int t = steps - 1; t >= 0; t--) {
-            NDArray gY = gYsStacked != null ? ScanUtil.sliceLeading(gYsStacked, t, yStepShape) : zeros(yStepShape);
-            List<NDArray> gStepIns = backwardInterpret(m.stepFn(), List.of(carryIn[t], xIn[t]), List.of(gCarry, gY));
+            NDArray gY = gYsStacked != null ? ScanUtil.sliceLeading(gYsStacked, t, yStepShape) : zeros(yStepShape).to(gCarry.device());
+            List<NDArray> gStepIns = backwardInterpret(m.stepFn(), List.of(carryIn[t], xIn[t]), List.of(gCarry, gY), parentValues);
             gCarry = gStepIns.get(0);
             gXs[t] = gStepIns.get(1);
         }
@@ -272,7 +315,7 @@ public class Grad {
         return List.of(gCarry, ScanUtil.stackLeading(java.util.Arrays.asList(gXs)));
     }
 
-    private static NDArray executePrimitive(Primitive p, Equation eq, NDArray[] inputs) {
+    private static NDArray executePrimitive(Primitive p, Equation eq, NDArray[] inputs, Map<Integer, NDArray> parentValues) {
         return switch (p) {
             case ADD -> inputs[0].add(inputs[1]);
             case SUB -> inputs[0].sub(inputs[1]);
@@ -297,13 +340,13 @@ public class Grad {
             case COND -> {
                 CondMeta m = (CondMeta) eq.metadata();
                 Jaxpr branch = (inputs[0].toFloatArray()[0] != 0f) ? m.trueBranch() : m.falseBranch();
-                yield forwardInterpret(branch, List.of(inputs[1])).get(0);
+                yield forwardInterpret(branch, List.of(inputs[1]), parentValues).get(0);
             }
             case WHILE -> {
                 WhileMeta m = (WhileMeta) eq.metadata();
                 NDArray state = inputs[0];
-                while (forwardInterpret(m.condFn(), List.of(state)).get(0).toFloatArray()[0] != 0f) {
-                    state = forwardInterpret(m.bodyFn(), List.of(state)).get(0);
+                while (forwardInterpret(m.condFn(), List.of(state), parentValues).get(0).toFloatArray()[0] != 0f) {
+                    state = forwardInterpret(m.bodyFn(), List.of(state), parentValues).get(0);
                 }
                 yield state;
             }
@@ -316,7 +359,7 @@ public class Grad {
             case PSUM -> {
                 PmapContext ctx = PmapContext.current();
                 if (ctx == null) yield inputs[0];
-                yield new ConcreteNDArray(ctx.collective.psum(ctx.deviceIndex, inputs[0].toFloatArray()), inputs[0].shape());
+                yield new ConcreteNDArray(ctx.collective.psum(ctx.deviceIndex, inputs[0].toFloatArray()), inputs[0].shape()).to(inputs[0].device());
             }
             case ALL_GATHER -> {
                 PmapContext ctx = PmapContext.current();
@@ -339,7 +382,7 @@ public class Grad {
             case GATHER -> Numpy.takeEager(inputs[0], inputs[1]);
             case CHECKPOINT -> {
                 CheckpointMeta m = (CheckpointMeta) eq.metadata();
-                yield forwardInterpret(m.subJaxpr(), List.of(inputs[0])).get(0);
+                yield forwardInterpret(m.subJaxpr(), List.of(inputs[0]), parentValues).get(0);
             }
             case RESHAPE -> inputs[0].reshape(eq.outputs().get(0).shape());
             case TRANSPOSE -> {
@@ -378,22 +421,22 @@ public class Grad {
         };
     }
 
-    private static List<NDArray> computeVJPs(Primitive p, Equation eq, NDArray gOut, NDArray[] inputs) {
+    private static List<NDArray> computeVJPs(Primitive p, Equation eq, NDArray gOut, NDArray[] inputs, Map<Integer, NDArray> parentValues) {
         return switch (p) {
             case ADD -> List.of(broadcastLike(gOut, inputs[0]), broadcastLike(gOut, inputs[1]));
-            case SUB -> List.of(broadcastLike(gOut, inputs[0]), broadcastLike(gOut.mul(minusOne(gOut.shape(), gOut.dtype())), inputs[1]));
+            case SUB -> List.of(broadcastLike(gOut, inputs[0]), broadcastLike(gOut.mul(minusOne(gOut.shape(), gOut.dtype(), gOut.device())), inputs[1]));
             case MUL -> List.of(broadcastLike(gOut.mul(inputs[1]), inputs[0]), broadcastLike(gOut.mul(inputs[0]), inputs[1]));
             case DIV -> {
                 // d/da (a/b) = 1/b ; d/db (a/b) = -a/b^2
                 NDArray a = inputs[0];
                 NDArray b = inputs[1];
                 NDArray gA = broadcastLike(gOut.div(b), a);
-                NDArray gB = broadcastLike(gOut.mul(a).div(b).div(b).mul(minusOne(gOut.shape(), gOut.dtype())), b);
+                NDArray gB = broadcastLike(gOut.mul(a).div(b).div(b).mul(minusOne(gOut.shape(), gOut.dtype(), gOut.device())), b);
                 yield List.of(gA, gB);
             }
             case MEAN -> {
                 double n = inputs[0].shape().size();
-                NDArray gIn = broadcastLike(gOut.div(scalar(n, inputs[0].dtype())), inputs[0]);
+                NDArray gIn = broadcastLike(gOut.div(scalar(n, inputs[0].dtype(), gOut.device())), inputs[0]);
                 yield List.of(gIn);
             }
             case SUM -> List.of(broadcastLike(gOut, inputs[0]));
@@ -404,23 +447,23 @@ public class Grad {
             case MEAN_AXIS -> {
                 AxisMeta m = (AxisMeta) eq.metadata();
                 double axisSize = inputs[0].shape().dimensions()[m.axis()];
-                NDArray scaled = gOut.div(scalar(axisSize, gOut.dtype()));
+                NDArray scaled = gOut.div(scalar(axisSize, gOut.dtype(), gOut.device()));
                 yield List.of(axisBroadcastLike(scaled, inputs[0].shape(), m.axis()));
             }
             case EXP -> List.of(gOut.mul(inputs[0].exp()));
             case LOG -> List.of(gOut.div(inputs[0]));
             case SIN -> List.of(gOut.mul(inputs[0].cos()));
-            case COS -> List.of(gOut.mul(inputs[0].sin()).mul(minusOne(gOut.shape(), gOut.dtype())));
+            case COS -> List.of(gOut.mul(inputs[0].sin()).mul(minusOne(gOut.shape(), gOut.dtype(), gOut.device())));
             case TANH -> {
                 // d/dx tanh(x) = 1 - tanh(x)^2
                 NDArray t = inputs[0].tanh();
-                yield List.of(gOut.mul(ones(t.shape(), t.dtype()).sub(t.mul(t))));
+                yield List.of(gOut.mul(ones(t.shape(), t.dtype(), t.device()).sub(t.mul(t))));
             }
             case RELU -> List.of(reluGrad(gOut, inputs[0]));
             case SIGMOID -> {
                 // d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x))
                 NDArray s = inputs[0].sigmoid();
-                yield List.of(gOut.mul(s.mul(ones(s.shape(), s.dtype()).sub(s))));
+                yield List.of(gOut.mul(s.mul(ones(s.shape(), s.dtype(), s.device()).sub(s))));
             }
             case DOT -> {
                 // C = A . B  =>  dA = gOut . B^T ; dB = A^T . gOut
@@ -432,7 +475,7 @@ public class Grad {
                 // pred (inputs[0]) is not differentiable, mirroring jax.lax.cond.
                 CondMeta m = (CondMeta) eq.metadata();
                 Jaxpr branch = (inputs[0].toFloatArray()[0] != 0f) ? m.trueBranch() : m.falseBranch();
-                NDArray gOperand = backwardInterpret(branch, List.of(inputs[1]), List.of(gOut)).get(0);
+                NDArray gOperand = backwardInterpret(branch, List.of(inputs[1]), List.of(gOut), parentValues).get(0);
                 yield List.of(zerosLike(inputs[0]), gOperand);
             }
             case WHILE -> throw new UnsupportedOperationException(
@@ -470,7 +513,7 @@ public class Grad {
                 PmapContext ctx = PmapContext.current();
                 if (ctx == null) yield List.of(gOut);
                 yield List.of(new ConcreteNDArray(
-                    ctx.collective.psum(ctx.deviceIndex, gOut.toFloatArray()), gOut.shape()));
+                    ctx.collective.psum(ctx.deviceIndex, gOut.toFloatArray()), gOut.shape()).to(gOut.device()));
             }
             // VJP of all_gather: gOut has shape [D, *shard]; this shard's input contributed
             // only at slice [deviceIndex], so its gradient is that slice.
@@ -570,7 +613,7 @@ public class Grad {
                 gTable[row * dim + d] += g[p * dim + d];
             }
         }
-        return new ConcreteNDArray(gTable, tableShape);
+        return new ConcreteNDArray(gTable, tableShape, gOut.dtype(), gOut.device());
     }
 
     /**
@@ -592,8 +635,8 @@ public class Grad {
                 boolean aWins = isMax ? va >= vb : va <= vb;
                 if (aWins) gA[i] = g[i]; else gB[i] = g[i];
             }
-            return List.of(broadcastLike(new ConcreteNDArray(gA, outShape), a),
-                            broadcastLike(new ConcreteNDArray(gB, outShape), b));
+            return List.of(broadcastLike(new ConcreteNDArray(gA, outShape, a.device()), a),
+                            broadcastLike(new ConcreteNDArray(gB, outShape, b.device()), b));
         }
         float[] g = gOut.toFloatArray();
         float[] av = a.toFloatArray();
@@ -606,8 +649,8 @@ public class Grad {
             boolean aWins = isMax ? va >= vb : va <= vb;
             if (aWins) gA[i] = g[i]; else gB[i] = g[i];
         }
-        return List.of(broadcastLike(new ConcreteNDArray(gA, outShape), a),
-                        broadcastLike(new ConcreteNDArray(gB, outShape), b));
+        return List.of(broadcastLike(new ConcreteNDArray(gA, outShape, gOut.dtype(), a.device()), a),
+                        broadcastLike(new ConcreteNDArray(gB, outShape, gOut.dtype(), b.device()), b));
     }
 
     /**
@@ -617,14 +660,52 @@ public class Grad {
      * MEAN/SUM vjp seeds a scalar gradient that must spread across every input
      * element), expands {@code g} back out via broadcasting.
      */
+    private static NDArray onesForShape(Shape shape, DType dtype, Device device) {
+        int n = (int) shape.size();
+        if (dtype == DType.FLOAT64) {
+            double[] ones = new double[n];
+            java.util.Arrays.fill(ones, 1.0);
+            return new ConcreteNDArray(ones, shape, device);
+        }
+        float[] ones = new float[n];
+        java.util.Arrays.fill(ones, 1.0f);
+        return new ConcreteNDArray(ones, shape, DType.FLOAT32, device);
+    }
+
     private static NDArray broadcastLike(NDArray g, NDArray target) {
         Shape gShape = g.shape();
         Shape tShape = target.shape();
         if (gShape.equals(tShape)) return g;
 
+        if (Tracer.current() != null || g instanceof TracedNDArray || target instanceof TracedNDArray) {
+            if (gShape.size() == tShape.size()) {
+                return g.reshape(tShape);
+            }
+            if (gShape.size() < tShape.size()) {
+                NDArray ones = onesForShape(tShape, g.dtype(), g.device());
+                return g.mul(ones);
+            } else {
+                NDArray current = g;
+                int[] gDims = gShape.dimensions();
+                int[] tDims = tShape.dimensions();
+                int gRank = gDims.length;
+                int tRank = tDims.length;
+
+                for (int i = 0; i < gRank; i++) {
+                    int tIdx = i - (gRank - tRank);
+                    if (tIdx < 0) {
+                        current = current.sum(i, true);
+                    } else if (tDims[tIdx] == 1 && gDims[i] > 1) {
+                        current = current.sum(i, true);
+                    }
+                }
+                return current.reshape(tShape);
+            }
+        }
+
         if (g.dtype() == DType.FLOAT64) {
             if (gShape.size() == tShape.size()) {
-                return new ConcreteNDArray(g.toDoubleArray(), tShape);
+                return new ConcreteNDArray(g.toDoubleArray(), tShape, target.device());
             }
             double[] gData = g.toDoubleArray();
             double[] result = new double[(int) tShape.size()];
@@ -637,12 +718,12 @@ public class Grad {
                     result[tShape.broadcastIndex(gShape, i)] += gData[i];
                 }
             }
-            return new ConcreteNDArray(result, tShape);
+            return new ConcreteNDArray(result, tShape, target.device());
         }
 
         if (gShape.size() == tShape.size()) {
             // Same total size, different rank/shape: a pure reshape, no reduction needed.
-            return new ConcreteNDArray(g.toFloatArray(), tShape);
+            return new ConcreteNDArray(g.toFloatArray(), tShape, g.dtype(), target.device());
         }
 
         float[] gData = g.toFloatArray();
@@ -659,7 +740,7 @@ public class Grad {
                 result[tShape.broadcastIndex(gShape, i)] += gData[i];
             }
         }
-        return new ConcreteNDArray(result, tShape);
+        return new ConcreteNDArray(result, tShape, g.dtype(), target.device());
     }
 
     /** d/dx relu(x) = 1 if x > 0 else 0; no comparison primitive exists, so this drops to raw arrays. */
@@ -669,13 +750,13 @@ public class Grad {
             double[] xv = x.toDoubleArray();
             double[] result = new double[xv.length];
             for (int i = 0; i < xv.length; i++) result[i] = xv[i] > 0 ? g[i] : 0.0;
-            return new ConcreteNDArray(result, x.shape());
+            return new ConcreteNDArray(result, x.shape(), x.device());
         }
         float[] g = gOut.toFloatArray();
         float[] xv = x.toFloatArray();
         float[] result = new float[xv.length];
         for (int i = 0; i < xv.length; i++) result[i] = xv[i] > 0 ? g[i] : 0f;
-        return new ConcreteNDArray(result, x.shape());
+        return new ConcreteNDArray(result, x.shape(), gOut.dtype(), x.device());
     }
 
     /**
@@ -773,7 +854,7 @@ public class Grad {
                 continue;
             }
 
-            NDArray outPrimal = executePrimitive(eq.primitive(), eq, inPrimals);
+            NDArray outPrimal = executePrimitive(eq.primitive(), eq, inPrimals, primals);
             NDArray outTangent = computeJVP(eq.primitive(), eq, outPrimal, inPrimals, inTangents);
 
             primals.put(eq.outputs().get(0).id(), outPrimal);
@@ -950,24 +1031,32 @@ public class Grad {
     }
 
     private static NDArray scalar(double v, DType dtype) {
+        return scalar(v, dtype, Device.defaultDevice());
+    }
+
+    private static NDArray scalar(double v, DType dtype, Device device) {
         return switch (dtype) {
-            case FLOAT32 -> new ConcreteNDArray(new float[]{(float) v}, new Shape(1));
-            case FLOAT64 -> new ConcreteNDArray(new double[]{v}, new Shape(1));
+            case FLOAT32 -> new ConcreteNDArray(new float[]{(float) v}, new Shape(1), dtype, device);
+            case FLOAT64 -> new ConcreteNDArray(new double[]{v}, new Shape(1), device);
             default -> throw new IllegalArgumentException("scalar() only supports floating dtypes, got " + dtype);
         };
     }
 
     private static NDArray ones(Shape shape, DType dtype) {
+        return ones(shape, dtype, Device.defaultDevice());
+    }
+
+    private static NDArray ones(Shape shape, DType dtype, Device device) {
         return switch (dtype) {
             case FLOAT32 -> {
                 float[] data = new float[(int) shape.size()];
                 for (int i = 0; i < data.length; i++) data[i] = 1.0f;
-                yield new ConcreteNDArray(data, shape);
+                yield new ConcreteNDArray(data, shape, dtype, device);
             }
             case FLOAT64 -> {
                 double[] data = new double[(int) shape.size()];
                 for (int i = 0; i < data.length; i++) data[i] = 1.0;
-                yield new ConcreteNDArray(data, shape);
+                yield new ConcreteNDArray(data, shape, device);
             }
             default -> throw new IllegalArgumentException("ones() only supports floating dtypes, got " + dtype);
         };
@@ -988,7 +1077,7 @@ public class Grad {
 
     /** Zero gradient placeholder matching {@code x}'s own dtype when it's floating, else FLOAT32 (inert default). */
     private static NDArray zerosLike(NDArray x) {
-        return zeros(x.shape(), floatDtypeOrDefault(x.dtype()));
+        return zeros(x.shape(), floatDtypeOrDefault(x.dtype())).to(x.device());
     }
 
     /** Returns the inverse permutation of {@code perm}: {@code inv[perm[i]] = i}. */
@@ -1069,7 +1158,7 @@ public class Grad {
             for (int i = 0; i < m; i++)
                 for (int j = 0; j < n; j++)
                     out[i * n + j] = -av[i] * bv[j];
-            return new ConcreteNDArray(out, new Shape(m, n));
+            return new ConcreteNDArray(out, new Shape(m, n), a.device());
         }
         float[] av = a.toFloatArray();
         float[] bv = b.toFloatArray();
@@ -1077,7 +1166,7 @@ public class Grad {
         for (int i = 0; i < m; i++)
             for (int j = 0; j < n; j++)
                 out[i * n + j] = -av[i] * bv[j];
-        return new ConcreteNDArray(out, new Shape(m, n));
+        return new ConcreteNDArray(out, new Shape(m, n), a.dtype(), a.device());
     }
 
     /**
@@ -1091,16 +1180,20 @@ public class Grad {
     }
 
     private static NDArray minusOne(Shape shape, DType dtype) {
+        return minusOne(shape, dtype, Device.defaultDevice());
+    }
+
+    private static NDArray minusOne(Shape shape, DType dtype, Device device) {
         return switch (dtype) {
             case FLOAT32 -> {
                 float[] data = new float[(int) shape.size()];
                 for (int i = 0; i < data.length; i++) data[i] = -1.0f;
-                yield new ConcreteNDArray(data, shape);
+                yield new ConcreteNDArray(data, shape, dtype, device);
             }
             case FLOAT64 -> {
                 double[] data = new double[(int) shape.size()];
                 for (int i = 0; i < data.length; i++) data[i] = -1.0;
-                yield new ConcreteNDArray(data, shape);
+                yield new ConcreteNDArray(data, shape, device);
             }
             default -> throw new IllegalArgumentException("minusOne() only supports floating dtypes, got " + dtype);
         };

@@ -11,11 +11,13 @@ import com.marmanis.jax4j.ir.AxisMeta;
 import com.marmanis.jax4j.ir.CheckpointMeta;
 import com.marmanis.jax4j.ir.ConcatMeta;
 import com.marmanis.jax4j.ir.CustomVjpMeta;
+import com.marmanis.jax4j.ir.GridSample2DMeta;
 import com.marmanis.jax4j.ir.Equation;
 import com.marmanis.jax4j.ir.Jaxpr;
 import com.marmanis.jax4j.ir.PadMeta;
 import com.marmanis.jax4j.ir.PmapMeta;
 import com.marmanis.jax4j.ir.Primitive;
+import com.marmanis.jax4j.ir.SliceMeta;
 import com.marmanis.jax4j.ir.TransposeMeta;
 import com.marmanis.jax4j.ir.Var;
 
@@ -457,6 +459,50 @@ public class Vmap {
             case CUSTOM_VJP -> {
                 CustomVjpMeta m = (CustomVjpMeta) metadata;
                 yield m.fn().apply(inputs[0]);
+            }
+            case SQRT -> inputs[0].sqrt();
+            case RSQRT -> inputs[0].rsqrt();
+            case MAX_AXIS, MIN_AXIS -> {
+                AxisMeta m = (AxisMeta) metadata;
+                int axis = batched[0] ? m.axis() + 1 : m.axis();
+                yield p == Primitive.MAX_AXIS ? inputs[0].max(axis, m.keepDims()) : inputs[0].min(axis, m.keepDims());
+            }
+            case SLICE -> {
+                SliceMeta m = (SliceMeta) metadata;
+                if (!batched[0]) yield inputs[0].slice(m.starts(), m.stops(), m.steps());
+                int B = inputs[0].shape().dimensions()[0];
+                int[] bStarts = new int[m.starts().length + 1];
+                int[] bStops  = new int[m.stops().length + 1];
+                int[] bSteps  = new int[m.steps().length + 1];
+                bStarts[0] = 0; bStops[0] = B; bSteps[0] = 1;
+                System.arraycopy(m.starts(), 0, bStarts, 1, m.starts().length);
+                System.arraycopy(m.stops(),  0, bStops,  1, m.stops().length);
+                System.arraycopy(m.steps(),  0, bSteps,  1, m.steps().length);
+                yield inputs[0].slice(bStarts, bStops, bSteps);
+            }
+            case MATMUL -> inputs[0].dot(inputs[1]);
+            case GRID_SAMPLE_2D -> {
+                GridSample2DMeta m = (GridSample2DMeta) metadata;
+                // Both input and grid are already rank-4 tensors carrying a
+                // batch dim; vmap prepends another leading axis. Slice per
+                // outer index and stitch results back together.
+                boolean bIn = batched[0];
+                boolean bGr = batched[1];
+                NDArray in = inputs[0];
+                NDArray gr = inputs[1];
+                if (!bIn && !bGr) {
+                    yield GridSampling.gridSample2dForward(in, gr, m.paddingMode());
+                }
+                int D = bIn ? in.shape().dimensions()[0] : gr.shape().dimensions()[0];
+                Shape inEx = bIn ? new Shape(Arrays.copyOfRange(in.shape().dimensions(), 1, in.shape().rank())) : in.shape();
+                Shape grEx = bGr ? new Shape(Arrays.copyOfRange(gr.shape().dimensions(), 1, gr.shape().rank())) : gr.shape();
+                List<NDArray> results = new ArrayList<>(D);
+                for (int d = 0; d < D; d++) {
+                    NDArray inD = bIn ? ScanUtil.sliceLeading(in, d, inEx) : in;
+                    NDArray grD = bGr ? ScanUtil.sliceLeading(gr, d, grEx) : gr;
+                    results.add(GridSampling.gridSample2dForward(inD, grD, m.paddingMode()));
+                }
+                yield ScanUtil.stackLeading(results);
             }
             default -> throw new UnsupportedOperationException(
                 "vmap has no batching rule for primitive: " + p);

@@ -178,6 +178,8 @@ public class TornadoVMBackend implements ExecutionBackend {
                 case TANH -> tg.task("k", TornadoVMBackend::vectorTanh, inA, out);
                 case RELU -> tg.task("k", TornadoVMBackend::vectorRelu, inA, out);
                 case SIGMOID -> tg.task("k", TornadoVMBackend::vectorSigmoid, inA, out);
+                case SQRT -> tg.task("k", TornadoVMBackend::vectorSqrt, inA, out);
+                case RSQRT -> tg.task("k", TornadoVMBackend::vectorRsqrt, inA, out);
                 default -> throw new UnsupportedOperationException("No TornadoVM kernel for " + primitive);
             };
             tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
@@ -314,6 +316,59 @@ public class TornadoVMBackend implements ExecutionBackend {
         }
     }
 
+    @Override
+    public float[] reduceAxis(Primitive primitive, float[] a, int outerSize, int axisSize, int innerSize, Device device) {
+        int outLength = outerSize * innerSize;
+        CacheKey key = new CacheKey(primitive, a.length, outerSize, axisSize, innerSize, false, device);
+        java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool =
+            PLAN_CACHE.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedQueue<>());
+
+        CachedPlan cached = pool.poll();
+        if (cached != null) {
+            try {
+                System.arraycopy(a, 0, cached.inA(), 0, a.length);
+                cached.plan().execute();
+                float[] out = new float[outLength];
+                System.arraycopy(cached.outF(), 0, out, 0, outLength);
+                boundedOffer(pool, cached);
+                return out;
+            } catch (Throwable t) {
+                log.warn("TornadoVM cached axis reduction failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
+                try {
+                    cached.plan().close();
+                } catch (Throwable ignore) {}
+                return HostBackend.INSTANCE.reduceAxis(primitive, a, outerSize, axisSize, innerSize, device);
+            }
+        }
+
+        float[] inA = a.clone();
+        float[] out = new float[outLength];
+        try {
+            TaskGraph tg = new TaskGraph("jax4j_reduce_axis_" + primitive + "_" + a.length + "_" + outerSize + "_" + innerSize)
+                .transferToDevice(DataTransferMode.EVERY_EXECUTION, inA);
+            tg = switch (primitive) {
+                case SUM -> tg.task("k", TornadoVMBackend::reduceAxisSum, inA, out, axisSize, innerSize);
+                case MEAN -> tg.task("k", TornadoVMBackend::reduceAxisMean, inA, out, axisSize, innerSize);
+                default -> throw new UnsupportedOperationException("No TornadoVM reduction kernel for " + primitive);
+            };
+            tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
+
+            ImmutableTaskGraph itg = tg.snapshot();
+            TornadoExecutionPlan plan = configuredPlan(itg, device);
+            plan.execute();
+
+            CachedPlan newPlan = new CachedPlan(plan, inA, null, out, null, null, null);
+            boundedOffer(pool, newPlan);
+
+            float[] result = new float[outLength];
+            System.arraycopy(out, 0, result, 0, outLength);
+            return result;
+        } catch (Throwable t) {
+            log.warn("TornadoVM axis reduction compilation failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
+            return HostBackend.INSTANCE.reduceAxis(primitive, a, outerSize, axisSize, innerSize, device);
+        }
+    }
+
     public static void vectorAdd(float[] a, float[] b, float[] c) {
         for (@Parallel int i = 0; i < a.length; i++) c[i] = a[i] + b[i];
     }
@@ -364,6 +419,14 @@ public class TornadoVMBackend implements ExecutionBackend {
 
     public static void vectorSigmoid(float[] a, float[] c) {
         for (@Parallel int i = 0; i < a.length; i++) c[i] = (float) (1.0 / (1.0 + Math.exp(-a[i])));
+    }
+
+    public static void vectorSqrt(float[] a, float[] c) {
+        for (@Parallel int i = 0; i < a.length; i++) c[i] = (float) Math.sqrt(a[i]);
+    }
+
+    public static void vectorRsqrt(float[] a, float[] c) {
+        for (@Parallel int i = 0; i < a.length; i++) c[i] = (float) (1.0 / Math.sqrt(a[i]));
     }
 
     @Override
@@ -530,6 +593,8 @@ public class TornadoVMBackend implements ExecutionBackend {
                 case TANH -> tg.task("k", TornadoVMBackend::vectorTanhD, inAd, out);
                 case RELU -> tg.task("k", TornadoVMBackend::vectorReluD, inAd, out);
                 case SIGMOID -> tg.task("k", TornadoVMBackend::vectorSigmoidD, inAd, out);
+                case SQRT -> tg.task("k", TornadoVMBackend::vectorSqrtD, inAd, out);
+                case RSQRT -> tg.task("k", TornadoVMBackend::vectorRsqrtD, inAd, out);
                 default -> throw new UnsupportedOperationException("No FP64 TornadoVM kernel for " + primitive);
             };
             tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
@@ -650,6 +715,14 @@ public class TornadoVMBackend implements ExecutionBackend {
         for (@Parallel int i = 0; i < a.length; i++) c[i] = 1.0 / (1.0 + Math.exp(-a[i]));
     }
 
+    public static void vectorSqrtD(double[] a, double[] c) {
+        for (@Parallel int i = 0; i < a.length; i++) c[i] = Math.sqrt(a[i]);
+    }
+
+    public static void vectorRsqrtD(double[] a, double[] c) {
+        for (@Parallel int i = 0; i < a.length; i++) c[i] = 1.0 / Math.sqrt(a[i]);
+    }
+
     public static void matmulKernelD(double[] a, double[] b, double[] c, int m, int k, int n) {
         for (@Parallel int i = 0; i < m; i++) {
             for (@Parallel int j = 0; j < n; j++) {
@@ -675,6 +748,30 @@ public class TornadoVMBackend implements ExecutionBackend {
     public static void vectorCopy(float[] a, float[] c) {
         for (@Parallel int i = 0; i < a.length; i++) {
             c[i] = a[i];
+        }
+    }
+
+    public static void reduceAxisSum(float[] input, float[] output, int axisSize, int innerSize) {
+        for (@Parallel int o = 0; o < output.length / innerSize; o++) {
+            for (@Parallel int inr = 0; inr < innerSize; inr++) {
+                float sum = 0f;
+                for (int a = 0; a < axisSize; a++) {
+                    sum += input[o * axisSize * innerSize + a * innerSize + inr];
+                }
+                output[o * innerSize + inr] = sum;
+            }
+        }
+    }
+
+    public static void reduceAxisMean(float[] input, float[] output, int axisSize, int innerSize) {
+        for (@Parallel int o = 0; o < output.length / innerSize; o++) {
+            for (@Parallel int inr = 0; inr < innerSize; inr++) {
+                float sum = 0f;
+                for (int a = 0; a < axisSize; a++) {
+                    sum += input[o * axisSize * innerSize + a * innerSize + inr];
+                }
+                output[o * innerSize + inr] = sum / axisSize;
+            }
         }
     }
 }

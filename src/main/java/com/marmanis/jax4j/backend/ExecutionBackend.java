@@ -10,6 +10,19 @@ import com.marmanis.jax4j.ir.Primitive;
  * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public interface ExecutionBackend {
+
+    /**
+     * Pick the appropriate backend for a given device: {@link TornadoVMBackend}
+     * when the device is TornadoVM-backed, otherwise {@link HostBackend}. This
+     * is the same rule {@code ConcreteNDArray} uses internally; exposed here
+     * so higher-level composites (convolutions, custom ops) can dispatch to
+     * the right kernel without depending on {@code ConcreteNDArray}'s
+     * package-private internals.
+     */
+    static ExecutionBackend forDevice(com.marmanis.jax4j.core.Device device) {
+        return device.getTornadoDevice() != null ? TornadoVMBackend.INSTANCE : HostBackend.INSTANCE;
+    }
+
     /** Computes {@code a <primitive> b} elementwise; {@code a} and {@code b} must be the same length. */
     float[] binary(Primitive primitive, float[] a, float[] b, Device device);
 
@@ -22,11 +35,19 @@ public interface ExecutionBackend {
     /** Computes the reduction of array `a` to a scalar. */
     float[] reduce(Primitive primitive, float[] a, Device device);
 
+    /** Computes the axis reduction of array `a` along `axis` with given outer, axis, and inner sizes. */
+    float[] reduceAxis(Primitive primitive, float[] a, int outerSize, int axisSize, int innerSize, Device device);
+
     /**
      * FLOAT64 reduction. Defaults to host.
      */
     default double[] reduce(Primitive primitive, double[] a, Device device) {
         return HostBackend.INSTANCE.reduce(primitive, a, device);
+    }
+
+    /** FLOAT64 axis reduction. Defaults to host. */
+    default double[] reduceAxis(Primitive primitive, double[] a, int outerSize, int axisSize, int innerSize, Device device) {
+        return HostBackend.INSTANCE.reduceAxis(primitive, a, outerSize, axisSize, innerSize, device);
     }
 
     /**

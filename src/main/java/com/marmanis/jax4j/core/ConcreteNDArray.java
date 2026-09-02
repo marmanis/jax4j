@@ -417,6 +417,11 @@ public class ConcreteNDArray implements NDArray {
             }
             return ((ConcreteNDArray) left).dot(right);
         }
+        // Batched matmul: any rank > 2 goes through MATMUL primitive path.
+        if (shape.rank() > 2 || other.shape().rank() > 2) {
+            requireSameFloatingDtype(other, "matmul");
+            return matmulEager(this, other);
+        }
         requireSameFloatingDtype(other, "dot");
         int M = shape.dimensions()[0];
         int K = shape.dimensions()[1];
@@ -521,31 +526,159 @@ public class ConcreteNDArray implements NDArray {
 
         if (dtype == DType.FLOAT64) {
             double[] in = f64();
-            double[] out = new double[(int) outShape.size()];
-            for (int o = 0; o < outerSize; o++) {
-                for (int inr = 0; inr < innerSize; inr++) {
-                    double total = 0;
-                    for (int a = 0; a < axisSize; a++) {
-                        total += in[o * axisSize * innerSize + a * innerSize + inr];
-                    }
-                    out[o * innerSize + inr] = mean ? total / axisSize : total;
-                }
-            }
+            double[] out = backendFor(device).reduceAxis(mean ? Primitive.MEAN : Primitive.SUM, in, outerSize, axisSize, innerSize, device);
             return new ConcreteNDArray(out, outShape, device);
         }
 
         float[] in = f32();
+        float[] out = backendFor(device).reduceAxis(mean ? Primitive.MEAN : Primitive.SUM, in, outerSize, axisSize, innerSize, device);
+        return new ConcreteNDArray(out, outShape, dtype, device);
+    }
+
+    @Override
+    public NDArray max(int axis, boolean keepDims) {
+        if (isTracing()) return toTraced().max(axis, keepDims);
+        requireFloatingDtype("max");
+        return maxMinAxis(axis, keepDims, true);
+    }
+
+    @Override
+    public NDArray min(int axis, boolean keepDims) {
+        if (isTracing()) return toTraced().min(axis, keepDims);
+        requireFloatingDtype("min");
+        return maxMinAxis(axis, keepDims, false);
+    }
+
+    private NDArray maxMinAxis(int axis, boolean keepDims, boolean isMax) {
+        int norm = shape.normalizeAxis(axis);
+        int[] dims = shape.dimensions();
+        int axisSize = dims[norm];
+        int outerSize = 1;
+        for (int i = 0; i < norm; i++) outerSize *= dims[i];
+        int innerSize = 1;
+        for (int i = norm + 1; i < dims.length; i++) innerSize *= dims[i];
+        Shape outShape = shape.reduceAxis(norm, keepDims);
+
+        if (dtype == DType.FLOAT64) {
+            double[] in = f64();
+            double[] out = new double[(int) outShape.size()];
+            for (int o = 0; o < outerSize; o++) {
+                for (int inr = 0; inr < innerSize; inr++) {
+                    double best = in[o * axisSize * innerSize + inr];
+                    for (int a = 1; a < axisSize; a++) {
+                        double v = in[o * axisSize * innerSize + a * innerSize + inr];
+                        if (isMax ? v > best : v < best) best = v;
+                    }
+                    out[o * innerSize + inr] = best;
+                }
+            }
+            return new ConcreteNDArray(out, outShape, device);
+        }
+        float[] in = f32();
         float[] out = new float[(int) outShape.size()];
         for (int o = 0; o < outerSize; o++) {
             for (int inr = 0; inr < innerSize; inr++) {
-                float total = 0;
-                for (int a = 0; a < axisSize; a++) {
-                    total += in[o * axisSize * innerSize + a * innerSize + inr];
+                float best = in[o * axisSize * innerSize + inr];
+                for (int a = 1; a < axisSize; a++) {
+                    float v = in[o * axisSize * innerSize + a * innerSize + inr];
+                    if (isMax ? v > best : v < best) best = v;
                 }
-                out[o * innerSize + inr] = mean ? total / axisSize : total;
+                out[o * innerSize + inr] = best;
             }
         }
         return new ConcreteNDArray(out, outShape, dtype, device);
+    }
+
+    @Override
+    public NDArray slice(int[] starts, int[] stops, int[] steps) {
+        if (isTracing()) return toTraced().slice(starts, stops, steps);
+        int rank = shape.rank();
+        if (starts.length != rank || stops.length != rank || steps.length != rank) {
+            throw new IllegalArgumentException(
+                "slice: starts/stops/steps must all have length " + rank + ", got "
+                    + starts.length + "/" + stops.length + "/" + steps.length);
+        }
+        int[] inDims = shape.dimensions();
+        int[] outDims = new int[rank];
+        int[] realStops = new int[rank];
+        for (int i = 0; i < rank; i++) {
+            if (steps[i] <= 0) throw new IllegalArgumentException("slice: step must be positive, got " + steps[i]);
+            int stop = stops[i] == -1 ? inDims[i] : stops[i];
+            realStops[i] = stop;
+            int span = stop - starts[i];
+            outDims[i] = span <= 0 ? 0 : (span + steps[i] - 1) / steps[i];
+        }
+        Shape outShape = new Shape(outDims);
+        int size = (int) outShape.size();
+
+        int[] inStrides = new int[rank];
+        inStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--) inStrides[i] = inStrides[i + 1] * inDims[i + 1];
+
+        switch (storage) {
+            case F32Storage s -> {
+                float[] in = s.data();
+                float[] out = new float[size];
+                sliceCopyF32(in, out, outDims, starts, steps, inStrides, rank);
+                return new ConcreteNDArray(out, outShape, DType.FLOAT32, device);
+            }
+            case F64Storage s -> {
+                double[] in = s.data();
+                double[] out = new double[size];
+                sliceCopyF64(in, out, outDims, starts, steps, inStrides, rank);
+                return new ConcreteNDArray(out, outShape, device);
+            }
+            case I32Storage s -> {
+                int[] in = s.data();
+                int[] out = new int[size];
+                for (int outFlat = 0; outFlat < size; outFlat++) {
+                    int inFlat = sliceInIndex(outFlat, outDims, starts, steps, inStrides, rank);
+                    out[outFlat] = in[inFlat];
+                }
+                return new ConcreteNDArray(out, outShape, device);
+            }
+            case I64Storage s -> {
+                long[] in = s.data();
+                long[] out = new long[size];
+                for (int outFlat = 0; outFlat < size; outFlat++) {
+                    int inFlat = sliceInIndex(outFlat, outDims, starts, steps, inStrides, rank);
+                    out[outFlat] = in[inFlat];
+                }
+                return new ConcreteNDArray(out, outShape, device);
+            }
+            case BoolStorage s -> {
+                boolean[] in = s.data();
+                boolean[] out = new boolean[size];
+                for (int outFlat = 0; outFlat < size; outFlat++) {
+                    int inFlat = sliceInIndex(outFlat, outDims, starts, steps, inStrides, rank);
+                    out[outFlat] = in[inFlat];
+                }
+                return new ConcreteNDArray(out, outShape, device);
+            }
+        }
+    }
+
+    private static int sliceInIndex(int outFlat, int[] outDims, int[] starts, int[] steps, int[] inStrides, int rank) {
+        int rem = outFlat;
+        int inFlat = 0;
+        for (int i = rank - 1; i >= 0; i--) {
+            int coord = rem % outDims[i];
+            rem /= outDims[i];
+            inFlat += (starts[i] + coord * steps[i]) * inStrides[i];
+        }
+        return inFlat;
+    }
+
+    private static void sliceCopyF32(float[] in, float[] out, int[] outDims, int[] starts, int[] steps, int[] inStrides, int rank) {
+        for (int outFlat = 0; outFlat < out.length; outFlat++) {
+            out[outFlat] = in[sliceInIndex(outFlat, outDims, starts, steps, inStrides, rank)];
+        }
+    }
+
+    private static void sliceCopyF64(double[] in, double[] out, int[] outDims, int[] starts, int[] steps, int[] inStrides, int rank) {
+        for (int outFlat = 0; outFlat < out.length; outFlat++) {
+            out[outFlat] = in[sliceInIndex(outFlat, outDims, starts, steps, inStrides, rank)];
+        }
     }
 
     @Override
@@ -659,6 +792,8 @@ public class ConcreteNDArray implements NDArray {
     @Override public NDArray log() { return unary(Primitive.LOG, Math::log, NDArray::log); }
     @Override public NDArray sin() { return unary(Primitive.SIN, Math::sin, NDArray::sin); }
     @Override public NDArray cos() { return unary(Primitive.COS, Math::cos, NDArray::cos); }
+    @Override public NDArray sqrt() { return unary(Primitive.SQRT, Math::sqrt, NDArray::sqrt); }
+    @Override public NDArray rsqrt() { return unary(Primitive.RSQRT, x -> 1.0 / Math.sqrt(x), NDArray::rsqrt); }
 
     @Override public NDArray tanh() { return unary(Primitive.TANH, Math::tanh, NDArray::tanh); }
     @Override public NDArray relu() { return unary(Primitive.RELU, x -> Math.max(0.0, x), NDArray::relu); }
@@ -974,5 +1109,111 @@ public class ConcreteNDArray implements NDArray {
     @Override
     public int hashCode() {
         return storage.dataHashCode() * 31 + shape.hashCode();
+    }
+
+    /**
+     * Batched matmul over the last two axes with numpy-style batch broadcasting.
+     * Public because {@code Grad}'s MATMUL executePrimitive and VJP reuse the same kernel.
+     * Both operands must share a floating dtype.
+     */
+    public static NDArray matmulEager(NDArray a, NDArray b) {
+        int[] aDims = a.shape().dimensions();
+        int[] bDims = b.shape().dimensions();
+        if (aDims.length < 2 || bDims.length < 2) {
+            throw new IllegalArgumentException("matmul: both operands must have rank >= 2");
+        }
+        int M = aDims[aDims.length - 2];
+        int Ka = aDims[aDims.length - 1];
+        int Kb = bDims[bDims.length - 2];
+        int N = bDims[bDims.length - 1];
+        if (Ka != Kb) throw new IllegalArgumentException("matmul: inner-dim mismatch " + Ka + " vs " + Kb);
+        int K = Ka;
+
+        int[] aBatch = java.util.Arrays.copyOfRange(aDims, 0, aDims.length - 2);
+        int[] bBatch = java.util.Arrays.copyOfRange(bDims, 0, bDims.length - 2);
+        int[] outBatch = broadcastBatch(aBatch, bBatch);
+        int batchTotal = 1;
+        for (int d : outBatch) batchTotal *= d;
+
+        int[] outDims = new int[outBatch.length + 2];
+        System.arraycopy(outBatch, 0, outDims, 0, outBatch.length);
+        outDims[outDims.length - 2] = M;
+        outDims[outDims.length - 1] = N;
+        Shape outShape = new Shape(outDims);
+
+        int aBatchTotal = 1; for (int d : aBatch) aBatchTotal *= d;
+        int bBatchTotal = 1; for (int d : bBatch) bBatchTotal *= d;
+
+        if (a.dtype() == DType.FLOAT64) {
+            double[] aData = a.toDoubleArray();
+            double[] bData = b.toDoubleArray();
+            double[] out = new double[batchTotal * M * N];
+            for (int batch = 0; batch < batchTotal; batch++) {
+                int aBatchIdx = broadcastBatchIndex(batch, outBatch, aBatch);
+                int bBatchIdx = broadcastBatchIndex(batch, outBatch, bBatch);
+                int aOff = aBatchIdx * M * K;
+                int bOff = bBatchIdx * K * N;
+                int outOff = batch * M * N;
+                for (int i = 0; i < M; i++) {
+                    for (int j = 0; j < N; j++) {
+                        double sum = 0;
+                        for (int k = 0; k < K; k++) sum += aData[aOff + i * K + k] * bData[bOff + k * N + j];
+                        out[outOff + i * N + j] = sum;
+                    }
+                }
+            }
+            return new ConcreteNDArray(out, outShape, a.device());
+        }
+        float[] aData = a.toFloatArray();
+        float[] bData = b.toFloatArray();
+        float[] out = new float[batchTotal * M * N];
+        for (int batch = 0; batch < batchTotal; batch++) {
+            int aBatchIdx = broadcastBatchIndex(batch, outBatch, aBatch);
+            int bBatchIdx = broadcastBatchIndex(batch, outBatch, bBatch);
+            int aOff = aBatchIdx * M * K;
+            int bOff = bBatchIdx * K * N;
+            int outOff = batch * M * N;
+            for (int i = 0; i < M; i++) {
+                for (int j = 0; j < N; j++) {
+                    float sum = 0;
+                    for (int k = 0; k < K; k++) sum += aData[aOff + i * K + k] * bData[bOff + k * N + j];
+                    out[outOff + i * N + j] = sum;
+                }
+            }
+        }
+        return new ConcreteNDArray(out, outShape, DType.FLOAT32, a.device());
+    }
+
+    /** Broadcasts two batch-dim arrays (numpy right-align) and returns the resulting shape. */
+    private static int[] broadcastBatch(int[] a, int[] b) {
+        int rank = Math.max(a.length, b.length);
+        int[] out = new int[rank];
+        for (int i = 0; i < rank; i++) {
+            int da = i < rank - a.length ? 1 : a[i - (rank - a.length)];
+            int db = i < rank - b.length ? 1 : b[i - (rank - b.length)];
+            if (da != db && da != 1 && db != 1) {
+                throw new IllegalArgumentException(
+                    "matmul: incompatible batch shapes " + java.util.Arrays.toString(a) + " and " + java.util.Arrays.toString(b));
+            }
+            out[i] = Math.max(da, db);
+        }
+        return out;
+    }
+
+    /** Maps an output batch flat index to the corresponding flat index in an operand's batch shape. */
+    private static int broadcastBatchIndex(int outFlat, int[] outBatch, int[] opBatch) {
+        if (opBatch.length == 0) return 0;
+        int rank = outBatch.length;
+        int offset = rank - opBatch.length;
+        int rem = outFlat;
+        int[] coords = new int[rank];
+        for (int i = rank - 1; i >= 0; i--) { coords[i] = rem % outBatch[i]; rem /= outBatch[i]; }
+        int flat = 0;
+        for (int i = 0; i < opBatch.length; i++) {
+            int dim = opBatch[i];
+            int coord = dim == 1 ? 0 : coords[i + offset];
+            flat = flat * dim + coord;
+        }
+        return flat;
     }
 }

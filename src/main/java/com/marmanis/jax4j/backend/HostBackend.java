@@ -47,6 +47,8 @@ public class HostBackend implements ExecutionBackend {
                 case TANH -> (float) Math.tanh(a[i]);
                 case RELU -> Math.max(0f, a[i]);
                 case SIGMOID -> (float) (1.0 / (1.0 + Math.exp(-a[i])));
+                case SQRT -> (float) Math.sqrt(a[i]);
+                case RSQRT -> (float) (1.0 / Math.sqrt(a[i]));
                 default -> throw new UnsupportedOperationException("Not a unary elementwise primitive: " + primitive);
             };
         }
@@ -95,6 +97,8 @@ public class HostBackend implements ExecutionBackend {
                 case TANH -> Math.tanh(a[i]);
                 case RELU -> Math.max(0.0, a[i]);
                 case SIGMOID -> 1.0 / (1.0 + Math.exp(-a[i]));
+                case SQRT -> Math.sqrt(a[i]);
+                case RSQRT -> 1.0 / Math.sqrt(a[i]);
                 default -> throw new UnsupportedOperationException("Not a unary elementwise primitive: " + primitive);
             };
         }
@@ -132,5 +136,37 @@ public class HostBackend implements ExecutionBackend {
             sum /= a.length;
         }
         return new double[]{sum};
+    }
+
+    @Override
+    public float[] reduceAxis(Primitive primitive, float[] a, int outerSize, int axisSize, int innerSize, Device device) {
+        float[] out = new float[outerSize * innerSize];
+        boolean mean = (primitive == Primitive.MEAN);
+        for (int o = 0; o < outerSize; o++) {
+            for (int inr = 0; inr < innerSize; inr++) {
+                float total = 0f;
+                for (int ax = 0; ax < axisSize; ax++) {
+                    total += a[o * axisSize * innerSize + ax * innerSize + inr];
+                }
+                out[o * innerSize + inr] = mean ? total / axisSize : total;
+            }
+        }
+        return out;
+    }
+
+    @Override
+    public double[] reduceAxis(Primitive primitive, double[] a, int outerSize, int axisSize, int innerSize, Device device) {
+        double[] out = new double[outerSize * innerSize];
+        boolean mean = (primitive == Primitive.MEAN);
+        for (int o = 0; o < outerSize; o++) {
+            for (int inr = 0; inr < innerSize; inr++) {
+                double total = 0.0;
+                for (int ax = 0; ax < axisSize; ax++) {
+                    total += a[o * axisSize * innerSize + ax * innerSize + inr];
+                }
+                out[o * innerSize + inr] = mean ? total / axisSize : total;
+            }
+        }
+        return out;
     }
 }

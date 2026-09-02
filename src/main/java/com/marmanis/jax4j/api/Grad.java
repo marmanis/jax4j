@@ -5,6 +5,7 @@ import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.ConcreteNDArray;
 import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.Shape;
+import com.marmanis.jax4j.core.PRNGKey;
 import java.util.Arrays;
 import com.marmanis.jax4j.api.Fft;
 import com.marmanis.jax4j.api.Linalg;
@@ -12,14 +13,21 @@ import com.marmanis.jax4j.ir.AxisMeta;
 import com.marmanis.jax4j.ir.CheckpointMeta;
 import com.marmanis.jax4j.ir.ConcatMeta;
 import com.marmanis.jax4j.ir.CondMeta;
+import com.marmanis.jax4j.ir.Conv2DMeta;
+import com.marmanis.jax4j.ir.Conv2DTransposeMeta;
 import com.marmanis.jax4j.ir.CustomVjpMeta;
+import com.marmanis.jax4j.ir.DepthwiseConv2DMeta;
+import com.marmanis.jax4j.ir.GridSample2DMeta;
+import com.marmanis.jax4j.ir.Pool2DMeta;
 import com.marmanis.jax4j.ir.Equation;
 import com.marmanis.jax4j.ir.Jaxpr;
 import com.marmanis.jax4j.ir.PadMeta;
 import com.marmanis.jax4j.ir.PmapMeta;
 import com.marmanis.jax4j.ir.Primitive;
 import com.marmanis.jax4j.ir.ScanMeta;
+import com.marmanis.jax4j.ir.SliceMeta;
 import com.marmanis.jax4j.ir.TransposeMeta;
+import com.marmanis.jax4j.ir.RandomMeta;
 import com.marmanis.jax4j.ir.Var;
 import com.marmanis.jax4j.ir.WhileMeta;
 import com.marmanis.jax4j.pytree.PyTree;
@@ -252,6 +260,26 @@ public class Grad {
                 List<NDArray> outs = scanForward(eq, inputs, values);
                 values.put(eq.outputs().get(0).id(), outs.get(0));
                 values.put(eq.outputs().get(1).id(), outs.get(1));
+            } else if (eq.primitive() == Primitive.RANDOM_SPLIT) {
+                if (Tracer.current() != null) {
+                    Tracer tracer = Tracer.current();
+                    List<Var> outVars = new ArrayList<>();
+                    for (int j = 0; j < eq.outputs().size(); j++) {
+                        Var outVar = tracer.nextVar(new Shape(), DType.INT64);
+                        outVars.add(outVar);
+                        values.put(eq.outputs().get(j).id(), new TracedNDArray(outVar));
+                    }
+                    tracer.addEquation(new Equation(
+                        List.of(((TracedNDArray) inputs[0]).getVar()),
+                        outVars,
+                        Primitive.RANDOM_SPLIT
+                    ));
+                } else {
+                    PRNGKey[] subkeys = Random.splitEager(inputs[0], eq.outputs().size());
+                    for (int j = 0; j < eq.outputs().size(); j++) {
+                        values.put(eq.outputs().get(j).id(), subkeys[j].keyArray());
+                    }
+                }
             } else {
                 NDArray out = executePrimitive(eq.primitive(), eq, inputs, values);
                 values.put(eq.outputs().get(0).id(), out);
@@ -417,6 +445,137 @@ public class Grad {
                 CustomVjpMeta m = (CustomVjpMeta) eq.metadata();
                 yield m.fn().apply(inputs[0]);
             }
+            case CONV2D -> {
+                Conv2DMeta m = (Conv2DMeta) eq.metadata();
+                yield Convolution.conv2dEager(inputs[0], inputs[1], m.strides(), m.padding());
+            }
+            case DEPTHWISE_CONV_2D -> {
+                DepthwiseConv2DMeta m = (DepthwiseConv2DMeta) eq.metadata();
+                yield Convolution.depthwiseConv2dEager(inputs[0], inputs[1], m.strides(), m.padding(), m.depthMultiplier());
+            }
+            case CONV_2D_TRANSPOSE -> {
+                Conv2DTransposeMeta m = (Conv2DTransposeMeta) eq.metadata();
+                yield Convolution.conv2dTransposeEager(inputs[0], inputs[1], m.strides(), m.padding());
+            }
+            case MAX_POOL_2D -> {
+                Pool2DMeta m = (Pool2DMeta) eq.metadata();
+                yield Convolution.maxPool2dEager(inputs[0], m.poolSize(), m.strides(), m.padding());
+            }
+            case AVG_POOL_2D -> {
+                Pool2DMeta m = (Pool2DMeta) eq.metadata();
+                yield Convolution.avgPool2dEager(inputs[0], m.poolSize(), m.strides(), m.padding());
+            }
+            case CONV3D -> {
+                com.marmanis.jax4j.ir.Conv3DMeta m = (com.marmanis.jax4j.ir.Conv3DMeta) eq.metadata();
+                yield Convolution.conv3dEager(inputs[0], inputs[1], m.strides(), m.padding());
+            }
+            case MAX_POOL_3D -> {
+                com.marmanis.jax4j.ir.Pool3DMeta m = (com.marmanis.jax4j.ir.Pool3DMeta) eq.metadata();
+                yield Convolution.maxPool3dEager(inputs[0], m.poolSize(), m.strides(), m.padding());
+            }
+            case AVG_POOL_3D -> {
+                com.marmanis.jax4j.ir.Pool3DMeta m = (com.marmanis.jax4j.ir.Pool3DMeta) eq.metadata();
+                yield Convolution.avgPool3dEager(inputs[0], m.poolSize(), m.strides(), m.padding());
+            }
+            case SQRT -> inputs[0].sqrt();
+            case RSQRT -> inputs[0].rsqrt();
+            case MAX_AXIS, MIN_AXIS -> {
+                AxisMeta m = (AxisMeta) eq.metadata();
+                yield p == Primitive.MAX_AXIS
+                    ? inputs[0].max(m.axis(), m.keepDims())
+                    : inputs[0].min(m.axis(), m.keepDims());
+            }
+            case SLICE -> {
+                SliceMeta m = (SliceMeta) eq.metadata();
+                yield inputs[0].slice(m.starts(), m.stops(), m.steps());
+            }
+            case MATMUL -> ConcreteNDArray.matmulEager(inputs[0], inputs[1]);
+            case GRID_SAMPLE_2D -> {
+                GridSample2DMeta m = (GridSample2DMeta) eq.metadata();
+                yield GridSampling.gridSample2dForward(inputs[0], inputs[1], m.paddingMode());
+            }
+            case RANDOM_SEED -> {
+                if (Tracer.current() != null) {
+                    Tracer tracer = Tracer.current();
+                    Var outVar = tracer.nextVar(new Shape(), DType.INT64);
+                    long initialSeed = (Long) eq.metadata();
+                    tracer.addEquation(new Equation(
+                        List.of(),
+                        List.of(outVar),
+                        Primitive.RANDOM_SEED,
+                        initialSeed
+                    ));
+                    yield new TracedNDArray(outVar);
+                } else {
+                    long initialSeed = (Long) eq.metadata();
+                    long dynamicSeed = mix64(initialSeed ^ System.nanoTime());
+                    yield new ConcreteNDArray(new long[]{dynamicSeed}, new Shape());
+                }
+            }
+            case RANDOM_UNIFORM -> {
+                RandomMeta.Uniform m = (RandomMeta.Uniform) eq.metadata();
+                if (inputs[0] instanceof TracedNDArray traced) {
+                    Tracer tracer = Tracer.current();
+                    Var outVar = tracer.nextVar(m.shape(), DType.FLOAT32);
+                    tracer.addEquation(new Equation(
+                        List.of(traced.getVar()),
+                        List.of(outVar),
+                        Primitive.RANDOM_UNIFORM,
+                        m
+                    ));
+                    yield new TracedNDArray(outVar);
+                } else {
+                    yield Random.uniformEager(inputs[0], m.shape(), m.lo(), m.hi());
+                }
+            }
+            case RANDOM_NORMAL -> {
+                RandomMeta.Normal m = (RandomMeta.Normal) eq.metadata();
+                if (inputs[0] instanceof TracedNDArray traced) {
+                    Tracer tracer = Tracer.current();
+                    Var outVar = tracer.nextVar(m.shape(), DType.FLOAT32);
+                    tracer.addEquation(new Equation(
+                        List.of(traced.getVar()),
+                        List.of(outVar),
+                        Primitive.RANDOM_NORMAL,
+                        m
+                    ));
+                    yield new TracedNDArray(outVar);
+                } else {
+                    yield Random.normalEager(inputs[0], m.shape());
+                }
+            }
+            case RANDOM_BERNOULLI -> {
+                RandomMeta.Bernoulli m = (RandomMeta.Bernoulli) eq.metadata();
+                if (inputs[0] instanceof TracedNDArray traced) {
+                    Tracer tracer = Tracer.current();
+                    Var outVar = tracer.nextVar(m.shape(), DType.BOOL);
+                    tracer.addEquation(new Equation(
+                        List.of(traced.getVar()),
+                        List.of(outVar),
+                        Primitive.RANDOM_BERNOULLI,
+                        m
+                    ));
+                    yield new TracedNDArray(outVar);
+                } else {
+                    yield Random.bernoulliEager(inputs[0], m.p(), m.shape());
+                }
+            }
+            case RANDOM_PERMUTATION -> {
+                RandomMeta.Permutation m = (RandomMeta.Permutation) eq.metadata();
+                if (inputs[0] instanceof TracedNDArray traced) {
+                    Tracer tracer = Tracer.current();
+                    Var outVar = tracer.nextVar(new Shape(m.n()), DType.INT32);
+                    tracer.addEquation(new Equation(
+                        List.of(traced.getVar()),
+                        List.of(outVar),
+                        Primitive.RANDOM_PERMUTATION,
+                        m
+                    ));
+                    yield new TracedNDArray(outVar);
+                } else {
+                    yield Random.permutationEager(inputs[0], m.n());
+                }
+            }
             default -> throw new UnsupportedOperationException(p.toString());
         };
     }
@@ -497,6 +656,10 @@ public class Grad {
             case MIN -> maxMinGrad(gOut, inputs[0], inputs[1], false);
             case ARGMAX, ARGMIN ->
                 // Index of an extremum has zero gradient w.r.t. the values, same convention as above.
+                List.of(zerosLike(inputs[0]));
+            case RANDOM_SEED ->
+                List.of();
+            case RANDOM_SPLIT, RANDOM_UNIFORM, RANDOM_NORMAL, RANDOM_BERNOULLI, RANDOM_PERMUTATION ->
                 List.of(zerosLike(inputs[0]));
             case PMAP -> {
                 PmapMeta m = (PmapMeta) eq.metadata();
@@ -591,8 +754,210 @@ public class Grad {
                 CustomVjpMeta m = (CustomVjpMeta) eq.metadata();
                 yield List.of(m.vjpFn().apply(inputs[0], gOut));
             }
+            case CONV2D -> {
+                Conv2DMeta m = (Conv2DMeta) eq.metadata();
+                NDArray[] gs = Convolution.conv2dBackward(inputs[0], inputs[1], gOut, m.strides(), m.padding());
+                yield List.of(gs[0], gs[1]);
+            }
+            case DEPTHWISE_CONV_2D -> {
+                DepthwiseConv2DMeta m = (DepthwiseConv2DMeta) eq.metadata();
+                NDArray[] gs = Convolution.depthwiseConv2dBackward(inputs[0], inputs[1], gOut,
+                    m.strides(), m.padding(), m.depthMultiplier());
+                yield List.of(gs[0], gs[1]);
+            }
+            case CONV_2D_TRANSPOSE -> {
+                Conv2DTransposeMeta m = (Conv2DTransposeMeta) eq.metadata();
+                NDArray[] gs = Convolution.conv2dTransposeBackward(inputs[0], inputs[1], gOut, m.strides(), m.padding());
+                yield List.of(gs[0], gs[1]);
+            }
+            case MAX_POOL_2D -> {
+                Pool2DMeta m = (Pool2DMeta) eq.metadata();
+                yield List.of(Convolution.maxPool2dBackward(inputs[0], gOut, m.poolSize(), m.strides(), m.padding()));
+            }
+            case AVG_POOL_2D -> {
+                Pool2DMeta m = (Pool2DMeta) eq.metadata();
+                yield List.of(Convolution.avgPool2dBackward(gOut, inputs[0].shape().dimensions(), m.poolSize(), m.strides(), m.padding()));
+            }
+            case SQRT -> {
+                // d/dx sqrt(x) = 0.5 / sqrt(x) = 0.5 * rsqrt(x)
+                NDArray half = scalar(0.5, gOut.dtype(), gOut.device());
+                yield List.of(gOut.mul(half).div(inputs[0].sqrt()));
+            }
+            case RSQRT -> {
+                // d/dx (x^-1/2) = -0.5 * x^-3/2 = -0.5 * rsqrt(x)^3
+                NDArray r = inputs[0].rsqrt();
+                NDArray coeff = scalar(-0.5, gOut.dtype(), gOut.device());
+                yield List.of(gOut.mul(coeff).mul(r).mul(r).mul(r));
+            }
+            case MAX_AXIS, MIN_AXIS -> {
+                AxisMeta m = (AxisMeta) eq.metadata();
+                yield List.of(maxMinAxisGrad(gOut, inputs[0], m.axis(), m.keepDims(), p == Primitive.MAX_AXIS));
+            }
+            case SLICE -> {
+                SliceMeta m = (SliceMeta) eq.metadata();
+                yield List.of(sliceBackward(gOut, inputs[0].shape(), m));
+            }
+            case MATMUL -> {
+                NDArray a = inputs[0];
+                NDArray b = inputs[1];
+                NDArray bT = swapLastTwo(b);
+                NDArray aT = swapLastTwo(a);
+                NDArray gA = matmulReduceBatch(ConcreteNDArray.matmulEager(gOut, bT), a.shape());
+                NDArray gB = matmulReduceBatch(ConcreteNDArray.matmulEager(aT, gOut), b.shape());
+                yield List.of(gA, gB);
+            }
+            case GRID_SAMPLE_2D -> {
+                GridSample2DMeta m = (GridSample2DMeta) eq.metadata();
+                NDArray gIn = GridSampling.gridSample2dBackwardInput(inputs[0], inputs[1], gOut, m.paddingMode());
+                yield List.of(gIn, zerosLike(inputs[1]));
+            }
             default -> throw new UnsupportedOperationException(p.toString());
         };
+    }
+
+    /** Transposes the last two axes of x, keeping leading batch axes in place. */
+    private static NDArray swapLastTwo(NDArray x) {
+        int rank = x.shape().rank();
+        int[] axes = new int[rank];
+        for (int i = 0; i < rank; i++) axes[i] = i;
+        axes[rank - 2] = rank - 1;
+        axes[rank - 1] = rank - 2;
+        return x.transpose(axes);
+    }
+
+    /**
+     * Reduces broadcast batch axes: after batched matmul with broadcasting, the
+     * output batch shape may exceed one operand's. Sum-reduce over any leading
+     * axes that were size-1 in the operand.
+     */
+    private static NDArray matmulReduceBatch(NDArray g, Shape targetShape) {
+        int[] gDims = g.shape().dimensions();
+        int[] tDims = targetShape.dimensions();
+        if (java.util.Arrays.equals(gDims, tDims)) return g;
+        NDArray current = g;
+        int gRank = gDims.length;
+        int tRank = tDims.length;
+        // Sum-reduce leading axes that don't exist in target.
+        while (current.shape().rank() > tRank) {
+            current = current.sum(0, false);
+        }
+        // For remaining aligned batch axes (all but the last two), reduce where target has size 1.
+        int[] cDims = current.shape().dimensions();
+        for (int i = 0; i < cDims.length - 2; i++) {
+            if (tDims[i] == 1 && cDims[i] > 1) {
+                current = current.sum(i, true);
+            }
+        }
+        if (!current.shape().equals(targetShape)) {
+            current = current.reshape(targetShape);
+        }
+        return current;
+    }
+
+    /**
+     * VJP for slice: zero-pad the gradient back to the original input shape, placing
+     * each output element at position {@code starts[i] + coord * steps[i]}.
+     */
+    private static NDArray sliceBackward(NDArray gOut, Shape origShape, SliceMeta m) {
+        int rank = origShape.rank();
+        int[] origDims = origShape.dimensions();
+        int[] gDims = gOut.shape().dimensions();
+        int[] inStrides = new int[rank];
+        inStrides[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--) inStrides[i] = inStrides[i + 1] * origDims[i + 1];
+
+        int gSize = (int) gOut.shape().size();
+        if (gOut.dtype() == DType.FLOAT64) {
+            double[] g = gOut.toDoubleArray();
+            double[] out = new double[(int) origShape.size()];
+            for (int gFlat = 0; gFlat < gSize; gFlat++) {
+                int rem = gFlat;
+                int inFlat = 0;
+                for (int i = rank - 1; i >= 0; i--) {
+                    int coord = rem % gDims[i];
+                    rem /= gDims[i];
+                    inFlat += (m.starts()[i] + coord * m.steps()[i]) * inStrides[i];
+                }
+                out[inFlat] = g[gFlat];
+            }
+            return new ConcreteNDArray(out, origShape, gOut.device());
+        }
+        float[] g = gOut.toFloatArray();
+        float[] out = new float[(int) origShape.size()];
+        for (int gFlat = 0; gFlat < gSize; gFlat++) {
+            int rem = gFlat;
+            int inFlat = 0;
+            for (int i = rank - 1; i >= 0; i--) {
+                int coord = rem % gDims[i];
+                rem /= gDims[i];
+                inFlat += (m.starts()[i] + coord * m.steps()[i]) * inStrides[i];
+            }
+            out[inFlat] = g[gFlat];
+        }
+        return new ConcreteNDArray(out, origShape, gOut.dtype(), gOut.device());
+    }
+
+    /**
+     * VJP for max/min axis reduction: gradient flows to argmax/argmin positions
+     * within each reduction slice; on ties, gradient is split equally.
+     */
+    private static NDArray maxMinAxisGrad(NDArray gOut, NDArray x, int axis, boolean keepDims, boolean isMax) {
+        int norm = x.shape().normalizeAxis(axis);
+        int[] dims = x.shape().dimensions();
+        int axisSize = dims[norm];
+        int outerSize = 1;
+        for (int i = 0; i < norm; i++) outerSize *= dims[i];
+        int innerSize = 1;
+        for (int i = norm + 1; i < dims.length; i++) innerSize *= dims[i];
+
+        if (x.dtype() == DType.FLOAT64) {
+            double[] xv = x.toDoubleArray();
+            double[] gv = gOut.toDoubleArray();
+            double[] out = new double[(int) x.shape().size()];
+            for (int o = 0; o < outerSize; o++) {
+                for (int inr = 0; inr < innerSize; inr++) {
+                    double best = xv[o * axisSize * innerSize + inr];
+                    for (int a = 1; a < axisSize; a++) {
+                        double v = xv[o * axisSize * innerSize + a * innerSize + inr];
+                        if (isMax ? v > best : v < best) best = v;
+                    }
+                    int tieCount = 0;
+                    for (int a = 0; a < axisSize; a++) {
+                        double v = xv[o * axisSize * innerSize + a * innerSize + inr];
+                        if (v == best) tieCount++;
+                    }
+                    double gVal = gv[o * innerSize + inr] / tieCount;
+                    for (int a = 0; a < axisSize; a++) {
+                        double v = xv[o * axisSize * innerSize + a * innerSize + inr];
+                        if (v == best) out[o * axisSize * innerSize + a * innerSize + inr] = gVal;
+                    }
+                }
+            }
+            return new ConcreteNDArray(out, x.shape(), x.device());
+        }
+        float[] xv = x.toFloatArray();
+        float[] gv = gOut.toFloatArray();
+        float[] out = new float[(int) x.shape().size()];
+        for (int o = 0; o < outerSize; o++) {
+            for (int inr = 0; inr < innerSize; inr++) {
+                float best = xv[o * axisSize * innerSize + inr];
+                for (int a = 1; a < axisSize; a++) {
+                    float v = xv[o * axisSize * innerSize + a * innerSize + inr];
+                    if (isMax ? v > best : v < best) best = v;
+                }
+                int tieCount = 0;
+                for (int a = 0; a < axisSize; a++) {
+                    float v = xv[o * axisSize * innerSize + a * innerSize + inr];
+                    if (v == best) tieCount++;
+                }
+                float gVal = gv[o * innerSize + inr] / tieCount;
+                for (int a = 0; a < axisSize; a++) {
+                    float v = xv[o * axisSize * innerSize + a * innerSize + inr];
+                    if (v == best) out[o * axisSize * innerSize + a * innerSize + inr] = gVal;
+                }
+            }
+        }
+        return new ConcreteNDArray(out, x.shape(), x.dtype(), x.device());
     }
 
     /**
@@ -1197,5 +1562,11 @@ public class Grad {
             }
             default -> throw new IllegalArgumentException("minusOne() only supports floating dtypes, got " + dtype);
         };
+    }
+
+    private static long mix64(long z) {
+        z = (z ^ (z >>> 30)) * 0xbf58476d1ce4e5b9L;
+        z = (z ^ (z >>> 27)) * 0x94d049bb133111ebL;
+        return z ^ (z >>> 31);
     }
 }

@@ -9,6 +9,7 @@ import com.marmanis.jax4j.ir.ConcatMeta;
 import com.marmanis.jax4j.ir.Equation;
 import com.marmanis.jax4j.ir.PadMeta;
 import com.marmanis.jax4j.ir.Primitive;
+import com.marmanis.jax4j.ir.SliceMeta;
 import com.marmanis.jax4j.ir.TransposeMeta;
 import com.marmanis.jax4j.ir.Var;
 
@@ -97,8 +98,34 @@ public class TracedNDArray implements NDArray {
             NDArray right = (other.dtype() == target) ? other : other.astype(target);
             return left.dot(right);
         }
-        Shape outShape = new Shape(shape().dimensions()[0], other.shape().dimensions()[1]);
+        // Batched matmul path: any rank > 2 becomes MATMUL.
+        int[] aDims = shape().dimensions();
+        int[] bDims = other.shape().dimensions();
+        if (aDims.length > 2 || bDims.length > 2) {
+            Shape outShape = matmulOutputShape(aDims, bDims);
+            return applyPrimitive(Primitive.MATMUL, List.of(this, other), outShape);
+        }
+        Shape outShape = new Shape(aDims[0], bDims[1]);
         return applyPrimitive(Primitive.DOT, List.of(this, other), outShape);
+    }
+
+    private static Shape matmulOutputShape(int[] aDims, int[] bDims) {
+        int M = aDims[aDims.length - 2];
+        int N = bDims[bDims.length - 1];
+        int[] aBatch = java.util.Arrays.copyOfRange(aDims, 0, aDims.length - 2);
+        int[] bBatch = java.util.Arrays.copyOfRange(bDims, 0, bDims.length - 2);
+        int rank = Math.max(aBatch.length, bBatch.length);
+        int[] outBatch = new int[rank];
+        for (int i = 0; i < rank; i++) {
+            int da = i < rank - aBatch.length ? 1 : aBatch[i - (rank - aBatch.length)];
+            int db = i < rank - bBatch.length ? 1 : bBatch[i - (rank - bBatch.length)];
+            outBatch[i] = Math.max(da, db);
+        }
+        int[] outDims = new int[rank + 2];
+        System.arraycopy(outBatch, 0, outDims, 0, rank);
+        outDims[rank] = M;
+        outDims[rank + 1] = N;
+        return new Shape(outDims);
     }
 
     @Override public NDArray exp() { return applyPrimitive(Primitive.EXP, List.of(this), shape()); }
@@ -109,6 +136,8 @@ public class TracedNDArray implements NDArray {
     @Override public NDArray tanh() { return applyPrimitive(Primitive.TANH, List.of(this), shape()); }
     @Override public NDArray relu() { return applyPrimitive(Primitive.RELU, List.of(this), shape()); }
     @Override public NDArray sigmoid() { return applyPrimitive(Primitive.SIGMOID, List.of(this), shape()); }
+    @Override public NDArray sqrt() { return applyPrimitive(Primitive.SQRT, List.of(this), shape()); }
+    @Override public NDArray rsqrt() { return applyPrimitive(Primitive.RSQRT, List.of(this), shape()); }
 
     @Override public NDArray sum() { return applyPrimitive(Primitive.SUM, List.of(this), new Shape(1)); }
     @Override public NDArray mean() { return applyPrimitive(Primitive.MEAN, List.of(this), new Shape(1)); }
@@ -134,6 +163,34 @@ public class TracedNDArray implements NDArray {
 
     @Override public NDArray max(NDArray other) { return elementwise(other, Primitive.MAX, NDArray::max); }
     @Override public NDArray min(NDArray other) { return elementwise(other, Primitive.MIN, NDArray::min); }
+
+    @Override
+    public NDArray max(int axis, boolean keepDims) {
+        int norm = shape().normalizeAxis(axis);
+        return applyPrimitive(Primitive.MAX_AXIS, List.of(this), shape().reduceAxis(norm, keepDims), new AxisMeta(norm, keepDims));
+    }
+
+    @Override
+    public NDArray min(int axis, boolean keepDims) {
+        int norm = shape().normalizeAxis(axis);
+        return applyPrimitive(Primitive.MIN_AXIS, List.of(this), shape().reduceAxis(norm, keepDims), new AxisMeta(norm, keepDims));
+    }
+
+    @Override
+    public NDArray slice(int[] starts, int[] stops, int[] steps) {
+        int rank = shape().rank();
+        if (starts.length != rank || stops.length != rank || steps.length != rank) {
+            throw new IllegalArgumentException("slice: starts/stops/steps must have length " + rank);
+        }
+        int[] inDims = shape().dimensions();
+        int[] outDims = new int[rank];
+        for (int i = 0; i < rank; i++) {
+            int stop = stops[i] == -1 ? inDims[i] : stops[i];
+            int span = stop - starts[i];
+            outDims[i] = span <= 0 ? 0 : (span + steps[i] - 1) / steps[i];
+        }
+        return applyPrimitive(Primitive.SLICE, List.of(this), new Shape(outDims), new SliceMeta(starts.clone(), stops.clone(), steps.clone()));
+    }
 
     @Override
     public NDArray argmax(int axis) {

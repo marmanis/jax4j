@@ -16,7 +16,11 @@ import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 import uk.ac.manchester.tornado.api.types.arrays.DoubleArray;
 import uk.ac.manchester.tornado.api.types.arrays.FloatArray;
 
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Discrete Fourier transforms, mirroring {@code jax.numpy.fft}. Two execution
@@ -810,7 +814,11 @@ public final class Fft {
     }
 
     private static Plan2F32 acquire2DF32(int n0, int n1, boolean inverse, Device dev) {
-        return plan2F32Cache.computeIfAbsent(planKey2(n0, n1, inverse, dev), k -> {
+        // Plan creation is pinned to the GPU thread (see GPU_EXECUTOR): the plan
+        // captures CUDA context state that is only valid for the thread that
+        // created it, so it must be built on the same thread that will later
+        // execute it (execPlan hops onto the same executor).
+        return plan2F32Cache.computeIfAbsent(planKey2(n0, n1, inverse, dev), k -> callOnGpuThread(() -> {
             int total = n0 * n1;
             FloatArray a = new FloatArray(2 * total);
             FloatArray b = new FloatArray(2 * total);
@@ -825,11 +833,12 @@ public final class Fft {
             TornadoExecutionPlan p = new TornadoExecutionPlan(g.snapshot())
                 .withDevice(dev.getTornadoDevice());
             return new Plan2F32(a, b, p);
-        });
+        }));
     }
 
     private static Plan2F64 acquire2DF64(int n0, int n1, boolean inverse, Device dev) {
-        return plan2F64Cache.computeIfAbsent(planKey2(n0, n1, inverse, dev), k -> {
+        // Plan creation is pinned to the GPU thread — see acquire2DF32.
+        return plan2F64Cache.computeIfAbsent(planKey2(n0, n1, inverse, dev), k -> callOnGpuThread(() -> {
             int total = n0 * n1;
             DoubleArray a = new DoubleArray(2 * total);
             DoubleArray b = new DoubleArray(2 * total);
@@ -844,7 +853,7 @@ public final class Fft {
             TornadoExecutionPlan p = new TornadoExecutionPlan(g.snapshot())
                 .withDevice(dev.getTornadoDevice());
             return new Plan2F64(a, b, p);
-        });
+        }));
     }
 
     private static NDArray[] cufftDispatch2DF32(
@@ -1654,12 +1663,51 @@ public final class Fft {
         };
     }
 
-    private static void execPlan(TornadoExecutionPlan p, String failMsg) {
+    // ── GPU-thread affinity ─────────────────────────────────────────────────
+    //
+    // cuFFT plans and TornadoVM execution plans capture CUDA context state, and
+    // CUDA contexts are per-thread by default. If a cached plan is created on
+    // thread T1 and later executed from a different thread T2 (e.g. two Swing
+    // background workers in a GUI app), cuFFT silently produces garbage / NaN.
+    //
+    // To make cached plans safe for callers coming from arbitrary threads, we
+    // pin BOTH plan creation and plan execution to a single dedicated thread
+    // owned by this class. Every cached-plan dispatch site (2-D + 3-D + rfft3
+    // + irfft3) already routes through execPlan / acquire*; those two entry
+    // points hop onto this executor via runOnGpuThread / callOnGpuThread and
+    // block for the result, so callers see the same synchronous API but the
+    // actual GPU work always happens on the thread that owns the context.
+    private static final ExecutorService GPU_EXECUTOR =
+        Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "jax4j-cuFFT-gpu");
+            t.setDaemon(true);
+            return t;
+        });
+
+    /** Run {@code op} on the shared GPU thread; blocks and rethrows failures. */
+    static <T> T callOnGpuThread(Callable<T> op) {
         try {
-            p.execute();
-        } catch (Exception e) {
-            throw new RuntimeException(failMsg, e);
+            return GPU_EXECUTOR.submit(op).get();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("GPU dispatch interrupted", ie);
+        } catch (ExecutionException ee) {
+            Throwable cause = ee.getCause() != null ? ee.getCause() : ee;
+            if (cause instanceof RuntimeException re) throw re;
+            if (cause instanceof Error err) throw err;
+            throw new RuntimeException(cause);
         }
+    }
+
+    private static void execPlan(TornadoExecutionPlan p, String failMsg) {
+        callOnGpuThread(() -> {
+            try {
+                p.execute();
+            } catch (Exception e) {
+                throw new RuntimeException(failMsg, e);
+            }
+            return null;
+        });
     }
 
     /**
@@ -1687,7 +1735,8 @@ public final class Fft {
     }
 
     private static Plan3F32 acquireF32(int n0, int n1, int n2, boolean inverse, Device dev) {
-        return plan3F32Cache.computeIfAbsent(planKey(n0, n1, n2, inverse, dev), k -> {
+        // Plan creation is pinned to the GPU thread — see acquire2DF32.
+        return plan3F32Cache.computeIfAbsent(planKey(n0, n1, n2, inverse, dev), k -> callOnGpuThread(() -> {
             int total = n0 * n1 * n2;
             FloatArray a = new FloatArray(2 * total);
             FloatArray b = new FloatArray(2 * total);
@@ -1704,11 +1753,12 @@ public final class Fft {
             TornadoExecutionPlan p = new TornadoExecutionPlan(g.snapshot())
                 .withDevice(dev.getTornadoDevice());
             return new Plan3F32(a, b, p);
-        });
+        }));
     }
 
     private static Plan3F64 acquireF64(int n0, int n1, int n2, boolean inverse, Device dev) {
-        return plan3F64Cache.computeIfAbsent(planKey(n0, n1, n2, inverse, dev), k -> {
+        // Plan creation is pinned to the GPU thread — see acquire2DF32.
+        return plan3F64Cache.computeIfAbsent(planKey(n0, n1, n2, inverse, dev), k -> callOnGpuThread(() -> {
             int total = n0 * n1 * n2;
             DoubleArray a = new DoubleArray(2 * total);
             DoubleArray b = new DoubleArray(2 * total);
@@ -1725,7 +1775,7 @@ public final class Fft {
             TornadoExecutionPlan p = new TornadoExecutionPlan(g.snapshot())
                 .withDevice(dev.getTornadoDevice());
             return new Plan3F64(a, b, p);
-        });
+        }));
     }
 
     private static NDArray[] rfft3DispatchF32(NDArray x, Device dev, int n0, int n1, int n2) {

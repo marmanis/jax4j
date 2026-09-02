@@ -33,6 +33,15 @@ public interface NDArray {
     NDArray sin();
     NDArray cos();
 
+    /** Elementwise {@code sqrt(x)}, mirroring {@code jax.numpy.sqrt}. Differentiable
+     * (VJP: {@code 0.5 / sqrt(x)}). Input must be non-negative floating-point. */
+    NDArray sqrt();
+
+    /** Elementwise reciprocal square root {@code 1/sqrt(x)}, mirroring
+     * {@code jax.lax.rsqrt}. Differentiable and numerically stable — prefer over
+     * {@code x.sqrt().reciprocal()} or {@code exp(-0.5*log(x))}. */
+    NDArray rsqrt();
+
     // Activations
     NDArray tanh();
     NDArray relu();
@@ -78,6 +87,19 @@ public interface NDArray {
      */
     NDArray max(NDArray other);
     NDArray min(NDArray other);
+
+    /**
+     * Reduces along a single {@code axis} using max/min, mirroring
+     * {@code numpy.max(axis=, keepdims=)} / {@code numpy.min(...)}.
+     * Differentiable: the gradient flows to the argmax/argmin position(s) within
+     * each reduction slice; ties split the gradient equally.
+     */
+    NDArray max(int axis, boolean keepDims);
+    NDArray min(int axis, boolean keepDims);
+    /** Equivalent to {@code max(axis, false)}. */
+    default NDArray max(int axis) { return max(axis, false); }
+    /** Equivalent to {@code min(axis, false)}. */
+    default NDArray min(int axis) { return min(axis, false); }
 
     /** Equivalent to {@code this.max(lo).min(hi)}, mirroring {@code jax.numpy.clip}. */
     default NDArray clip(NDArray lo, NDArray hi) { return this.max(lo).min(hi); }
@@ -166,4 +188,63 @@ public interface NDArray {
      * see {@code Grad}'s {@code CAST} VJP rule).
      */
     NDArray astype(DType target);
+
+    /**
+     * General slicing (numpy-style) with per-axis {@code starts}, {@code stops}, and
+     * positive {@code steps}. All three arrays must have length equal to the input rank.
+     * {@code stops[i] == -1} is a sentinel meaning "to end of axis". Differentiable:
+     * the VJP zero-pads the gradient back to the original input shape (injecting zeros
+     * between kept positions for step &gt; 1).
+     */
+    NDArray slice(int[] starts, int[] stops, int[] steps);
+
+    /** Equivalent to {@code slice(starts, stops, ones)}. */
+    default NDArray slice(int[] starts, int[] stops) {
+        int[] steps = new int[starts.length];
+        java.util.Arrays.fill(steps, 1);
+        return slice(starts, stops, steps);
+    }
+
+    /** Slice one axis and keep every other axis full. */
+    default NDArray sliceAxis(int axis, int start, int stop) {
+        int rank = shape().rank();
+        int norm = axis < 0 ? rank + axis : axis;
+        int[] starts = new int[rank];
+        int[] stops = new int[rank];
+        int[] steps = new int[rank];
+        int[] dims = shape().dimensions();
+        for (int i = 0; i < rank; i++) {
+            starts[i] = 0;
+            stops[i] = dims[i];
+            steps[i] = 1;
+        }
+        starts[norm] = start;
+        stops[norm] = stop;
+        return slice(starts, stops, steps);
+    }
+
+    /**
+     * Pick one index along {@code axis}, reducing the rank of the result by one.
+     * Equivalent to {@code sliceAxis(axis, index, index+1)} followed by a squeeze
+     * along that axis.
+     */
+    default NDArray sliceIndex(int axis, int index) {
+        int rank = shape().rank();
+        int norm = axis < 0 ? rank + axis : axis;
+        NDArray s = sliceAxis(norm, index, index + 1);
+        int[] dims = s.shape().dimensions();
+        int[] out = new int[dims.length - 1];
+        for (int i = 0, j = 0; i < dims.length; i++) {
+            if (i != norm) out[j++] = dims[i];
+        }
+        return s.reshape(new Shape(out));
+    }
+
+    /**
+     * Matrix multiply. For rank &le; 2 both operands, equivalent to {@link #dot}.
+     * For rank &gt; 2, treats the last two axes as matrix axes and broadcasts all
+     * leading axes numpy-style: {@code A[..., M, K] @ B[..., K, N] -> [broadcast(...), M, N]}.
+     * Differentiable in both operands.
+     */
+    default NDArray matmul(NDArray other) { return dot(other); }
 }

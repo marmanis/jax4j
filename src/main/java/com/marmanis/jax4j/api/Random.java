@@ -1,9 +1,19 @@
 package com.marmanis.jax4j.api;
 
 import com.marmanis.jax4j.core.ConcreteNDArray;
+import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.PRNGKey;
 import com.marmanis.jax4j.core.Shape;
+import com.marmanis.jax4j.ir.Equation;
+import com.marmanis.jax4j.ir.Primitive;
+import com.marmanis.jax4j.ir.RandomMeta;
+import com.marmanis.jax4j.ir.Var;
+import com.marmanis.jax4j.tracing.TracedNDArray;
+import com.marmanis.jax4j.tracing.Tracer;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Explicit-key pseudo-random sampling, mirroring {@code jax.random}. Every
@@ -14,24 +24,7 @@ import com.marmanis.jax4j.core.Shape;
  * layer's init, another for a dropout mask, etc.), exactly like
  * {@code jax.random.split}.
  *
- * <p><b>Scope note:</b> the underlying generator is a SplitMix64-style 64-bit
- * mix, not JAX's Threefry counter-based generator — it gets the properties
- * that matter for principled stochastic training (pure, splittable,
- * reproducible, statistically sound) without bit-exact parity with Python JAX.
- *
- * <p><b>Why these are eager, not traced:</b> {@link PRNGKey} is a plain Java
- * value, never an {@link NDArray}, so it never appears inside a {@code Jaxpr}.
- * Every {@code Random} call immediately produces a concrete array. When used
- * inside a function being traced (e.g. {@link Nn#dropout} inside a {@code
- * JAX.grad}'d loss), that array is captured as an ordinary constant input to
- * whatever equation consumes it — the same mechanism {@link Lax}/{@link Nn}
- * already use for closed-over scalars. No new {@code Primitive}, VJP rule, or
- * {@code vmap} batching rule is needed.
- *
- * <p><b>Batched sampling:</b> to get one independent mask/sample per example
- * in a batch (e.g. per-example dropout), sample directly at the batch-inclusive
- * shape — {@code Random.bernoulli(key, p, new Shape(batchSize, ...))} — rather
- * than vmapping over an array of keys.
+ * <p>Supports both eager execution and tracing into a {@code Jaxpr} for JIT compilation.
  * @author <a href="mailto:babis@marmanis.com">Babis Marmanis</a>
  */
 public final class Random {
@@ -69,9 +62,32 @@ public final class Random {
 
     /** Mirrors {@code jax.random.split(key, num)}: derives {@code num} independent child keys. */
     public static PRNGKey[] split(PRNGKey key, int num) {
+        if (key.keyArray() instanceof TracedNDArray traced) {
+            Tracer tracer = Tracer.current();
+            List<Var> outVars = new ArrayList<>();
+            PRNGKey[] result = new PRNGKey[num];
+            for (int i = 0; i < num; i++) {
+                Var outVar = tracer.nextVar(new Shape(), DType.INT64);
+                outVars.add(outVar);
+                result[i] = new PRNGKey(new TracedNDArray(outVar));
+            }
+            tracer.addEquation(new Equation(
+                List.of(traced.getVar()),
+                outVars,
+                Primitive.RANDOM_SPLIT
+            ));
+            return result;
+        } else {
+            return splitEager(key.keyArray(), num);
+        }
+    }
+
+    public static PRNGKey[] splitEager(NDArray key, int num) {
+        long state = key.toLongArray()[0];
         PRNGKey[] result = new PRNGKey[num];
         for (int i = 0; i < num; i++) {
-            result[i] = new PRNGKey(mix64(key.state() ^ SPLIT_TAG ^ (GOLDEN_GAMMA * (i + 1))));
+            long subState = mix64(state ^ SPLIT_TAG ^ (GOLDEN_GAMMA * (i + 1)));
+            result[i] = new PRNGKey(new ConcreteNDArray(new long[]{subState}, new Shape()));
         }
         return result;
     }
@@ -81,17 +97,66 @@ public final class Random {
         return split(key, 2);
     }
 
+    /**
+     * Derive one subkey from a key and a 64-bit index, mirroring
+     * {@code jax.random.fold_in}. Domain-separated from {@link #split} via
+     * a distinct tag, so mixing {@code foldIn} and {@code split} on the same
+     * root key never accidentally correlates. Only the eager form is provided
+     * today; passing a traced key raises {@link UnsupportedOperationException}
+     * so callers know to derive per-batch keys on the host side.
+     *
+     * <p>This is the one-key analogue of {@code split(key, n)[i]} but avoids
+     * allocating {@code n} keys just to keep one — cheaper when threading
+     * a fresh subkey per training step or per layer within a model.
+     */
+    public static PRNGKey foldIn(PRNGKey key, long index) {
+        if (key.keyArray() instanceof TracedNDArray) {
+            throw new UnsupportedOperationException(
+                "Random.foldIn on a traced key is not yet supported; " +
+                "derive the subkey on the host side and pass it into the traced function as an input.");
+        }
+        long state = key.keyArray().toLongArray()[0];
+        long subState = mix64(state ^ SPLIT_TAG ^ (GOLDEN_GAMMA * (index + 1)));
+        return new PRNGKey(new ConcreteNDArray(new long[]{subState}, new Shape()));
+    }
+
     // ---- sampling ----
 
     /** Mirrors {@code jax.random.uniform(key, shape, minval=lo, maxval=hi)}. */
     public static NDArray uniform(PRNGKey key, Shape shape, float lo, float hi) {
+        if (key.keyArray() instanceof TracedNDArray traced) {
+            Tracer tracer = Tracer.current();
+            Var outVar = tracer.nextVar(shape, DType.FLOAT32);
+            tracer.addEquation(new Equation(
+                List.of(traced.getVar()),
+                List.of(outVar),
+                Primitive.RANDOM_UNIFORM,
+                new RandomMeta.Uniform(shape, lo, hi)
+            ));
+            return new TracedNDArray(outVar);
+        } else {
+            return uniformEager(key.keyArray(), shape, lo, hi);
+        }
+    }
+
+    public static NDArray uniformEager(NDArray key, Shape shape, float lo, float hi) {
+        long state = key.toLongArray()[0];
         int n = (int) shape.size();
         float[] data = new float[n];
-        for (int i = 0; i < n; i++) {
-            data[i] = lo + rawUniform01(key.state(), i) * (hi - lo);
+        // Each element is a pure function of (state, i), so the loop is
+        // trivially parallel. Big kernels (millions of samples in ResNet /
+        // DenseNet init) go from single-threaded 100ms-per-layer to
+        // amortized microseconds.
+        if (n >= PARALLEL_INIT_THRESHOLD) {
+            java.util.stream.IntStream.range(0, n).parallel()
+                    .forEach(i -> data[i] = lo + rawUniform01(state, i) * (hi - lo));
+        } else {
+            for (int i = 0; i < n; i++) data[i] = lo + rawUniform01(state, i) * (hi - lo);
         }
         return new ConcreteNDArray(data, shape);
     }
+
+    private static final int PARALLEL_INIT_THRESHOLD = 16_384;
 
     /** Equivalent to {@code uniform(key, shape, 0f, 1f)}. */
     public static NDArray uniform(PRNGKey key, Shape shape) {
@@ -103,22 +168,64 @@ public final class Random {
      * Each output element consumes two domain-separated uniform draws.
      */
     public static NDArray normal(PRNGKey key, Shape shape) {
+        if (key.keyArray() instanceof TracedNDArray traced) {
+            Tracer tracer = Tracer.current();
+            Var outVar = tracer.nextVar(shape, DType.FLOAT32);
+            tracer.addEquation(new Equation(
+                List.of(traced.getVar()),
+                List.of(outVar),
+                Primitive.RANDOM_NORMAL,
+                new RandomMeta.Normal(shape)
+            ));
+            return new TracedNDArray(outVar);
+        } else {
+            return normalEager(key.keyArray(), shape);
+        }
+    }
+
+    public static NDArray normalEager(NDArray key, Shape shape) {
+        long state = key.toLongArray()[0];
         int n = (int) shape.size();
         float[] data = new float[n];
-        for (int i = 0; i < n; i++) {
-            float u1 = Math.max(rawUniform01(key.state(), 2L * i), 1e-7f); // avoid log(0)
-            float u2 = rawUniform01(key.state(), 2L * i + 1);
-            data[i] = (float) (Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2));
+        if (n >= PARALLEL_INIT_THRESHOLD) {
+            java.util.stream.IntStream.range(0, n).parallel().forEach(i -> {
+                float u1 = Math.max(rawUniform01(state, 2L * i), 1e-7f);
+                float u2 = rawUniform01(state, 2L * i + 1);
+                data[i] = (float) (Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2));
+            });
+        } else {
+            for (int i = 0; i < n; i++) {
+                float u1 = Math.max(rawUniform01(state, 2L * i), 1e-7f);
+                float u2 = rawUniform01(state, 2L * i + 1);
+                data[i] = (float) (Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2));
+            }
         }
         return new ConcreteNDArray(data, shape);
     }
 
     /** Mirrors {@code jax.random.bernoulli(key, p, shape)}: true with probability {@code p}. Returns a real {@code DType.BOOL} array. */
     public static NDArray bernoulli(PRNGKey key, float p, Shape shape) {
+        if (key.keyArray() instanceof TracedNDArray traced) {
+            Tracer tracer = Tracer.current();
+            Var outVar = tracer.nextVar(shape, DType.BOOL);
+            tracer.addEquation(new Equation(
+                List.of(traced.getVar()),
+                List.of(outVar),
+                Primitive.RANDOM_BERNOULLI,
+                new RandomMeta.Bernoulli(p, shape)
+            ));
+            return new TracedNDArray(outVar);
+        } else {
+            return bernoulliEager(key.keyArray(), p, shape);
+        }
+    }
+
+    public static NDArray bernoulliEager(NDArray key, float p, Shape shape) {
+        long state = key.toLongArray()[0];
         int n = (int) shape.size();
         boolean[] data = new boolean[n];
         for (int i = 0; i < n; i++) {
-            data[i] = rawUniform01(key.state(), i) < p;
+            data[i] = rawUniform01(state, i) < p;
         }
         return new ConcreteNDArray(data, shape);
     }
@@ -129,10 +236,27 @@ public final class Random {
      * array, consistent with how {@code argmax}/{@code argmin} represent indices.
      */
     public static NDArray permutation(PRNGKey key, int n) {
+        if (key.keyArray() instanceof TracedNDArray traced) {
+            Tracer tracer = Tracer.current();
+            Var outVar = tracer.nextVar(new Shape(n), DType.INT32);
+            tracer.addEquation(new Equation(
+                List.of(traced.getVar()),
+                List.of(outVar),
+                Primitive.RANDOM_PERMUTATION,
+                new RandomMeta.Permutation(n)
+            ));
+            return new TracedNDArray(outVar);
+        } else {
+            return permutationEager(key.keyArray(), n);
+        }
+    }
+
+    public static NDArray permutationEager(NDArray key, int n) {
+        long state = key.toLongArray()[0];
         int[] idx = new int[n];
         for (int i = 0; i < n; i++) idx[i] = i;
         for (int i = n - 1; i > 0; i--) {
-            float u = rawUniform01(key.state(), i);
+            float u = rawUniform01(state, i);
             int j = Math.min((int) (u * (i + 1)), i);
             int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
         }

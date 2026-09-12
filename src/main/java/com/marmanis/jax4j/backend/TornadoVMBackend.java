@@ -8,7 +8,6 @@ import uk.ac.manchester.tornado.api.ImmutableTaskGraph;
 import uk.ac.manchester.tornado.api.TaskGraph;
 import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
 import uk.ac.manchester.tornado.api.annotations.Parallel;
-import uk.ac.manchester.tornado.api.annotations.Reduce;
 import uk.ac.manchester.tornado.api.enums.DataTransferMode;
 
 /**
@@ -200,120 +199,36 @@ public class TornadoVMBackend implements ExecutionBackend {
         }
     }
 
+    // ----------------------------------------------------------------
+    // Full-scalar reductions: HostBackend, always.
+    //
+    // The TornadoVM @Reduce annotation compiles into a ReduceTaskGraph
+    // whose SequentialExecutionThread combines the per-workgroup partial
+    // sums on the host. That thread runs JIT'd code that gets invalidated
+    // (e.g. under code-cache pressure or after class redefinition),
+    // throwing jdk.vm.ci.code.InvalidInstalledCodeException from a
+    // background thread — plan.execute() returns success while the
+    // combine step silently produced nothing. Callers (loss.mean(),
+    // scalar norms, ...) then see stale output and, in a training loop,
+    // gradients that never update: symptom on BioASQ was the model
+    // frozen at the training-set class prior across all 10+ epochs.
+    //
+    // A modern CPU sums millions of floats in a few milliseconds and
+    // scalar reductions run at most O(batchSize) times per step, so
+    // routing them straight to the host has negligible cost and avoids
+    // the fragile @Reduce path entirely. Per-axis reductions
+    // ({@link #reduceAxis}) use manual inner loops without @Reduce and
+    // remain on GPU.
+    // ----------------------------------------------------------------
+
     @Override
     public float[] reduce(Primitive primitive, float[] a, Device device) {
-        CacheKey key = new CacheKey(primitive, a.length, 0, 0, 0, false, device);
-        java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool =
-            PLAN_CACHE.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedQueue<>());
-
-        CachedPlan cached = pool.poll();
-        if (cached != null) {
-            try {
-                System.arraycopy(a, 0, cached.inA(), 0, a.length);
-                cached.outF()[0] = 0f; // reset accumulator for TornadoVM @Reduce
-                cached.plan().execute();
-                float[] out = new float[1];
-                out[0] = cached.outF()[0];
-                if (primitive == Primitive.MEAN) {
-                    out[0] /= a.length;
-                }
-                boundedOffer(pool, cached);
-                return out;
-            } catch (Throwable t) {
-                log.warn("TornadoVM cached reduction failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
-                try {
-                    cached.plan().close();
-                } catch (Throwable ignore) {}
-                return HostBackend.INSTANCE.reduce(primitive, a, device);
-            }
-        }
-
-        float[] inA = a.clone();
-        float[] out = new float[1];
-        try {
-            TaskGraph tg = new TaskGraph("jax4j_reduce_" + primitive + "_" + a.length)
-                .transferToDevice(DataTransferMode.EVERY_EXECUTION, inA);
-            tg = switch (primitive) {
-                case SUM, MEAN -> tg.task("k", TornadoVMBackend::reduceSum, inA, out);
-                default -> throw new UnsupportedOperationException("No TornadoVM reduction kernel for " + primitive);
-            };
-            tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
-
-            ImmutableTaskGraph itg = tg.snapshot();
-            TornadoExecutionPlan plan = configuredPlan(itg, device);
-            plan.execute();
-
-            CachedPlan newPlan = new CachedPlan(plan, inA, null, out, null, null, null);
-            boundedOffer(pool, newPlan);
-
-            float[] result = new float[1];
-            result[0] = out[0];
-            if (primitive == Primitive.MEAN) {
-                result[0] /= a.length;
-            }
-            return result;
-        } catch (Throwable t) {
-            log.warn("TornadoVM reduction failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
-            return HostBackend.INSTANCE.reduce(primitive, a, device);
-        }
+        return HostBackend.INSTANCE.reduce(primitive, a, device);
     }
 
     @Override
     public double[] reduce(Primitive primitive, double[] a, Device device) {
-        CacheKey key = new CacheKey(primitive, a.length, 0, 0, 0, true, device);
-        java.util.concurrent.ConcurrentLinkedQueue<CachedPlan> pool =
-            PLAN_CACHE.computeIfAbsent(key, k -> new java.util.concurrent.ConcurrentLinkedQueue<>());
-
-        CachedPlan cached = pool.poll();
-        if (cached != null) {
-            try {
-                System.arraycopy(a, 0, cached.inAd(), 0, a.length);
-                cached.outD()[0] = 0.0; // reset accumulator for TornadoVM @Reduce
-                cached.plan().execute();
-                double[] out = new double[1];
-                out[0] = cached.outD()[0];
-                if (primitive == Primitive.MEAN) {
-                    out[0] /= a.length;
-                }
-                boundedOffer(pool, cached);
-                return out;
-            } catch (Throwable t) {
-                log.warn("TornadoVM cached FP64 reduction failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
-                try {
-                    cached.plan().close();
-                } catch (Throwable ignore) {}
-                return HostBackend.INSTANCE.reduce(primitive, a, device);
-            }
-        }
-
-        double[] inAd = a.clone();
-        double[] out = new double[1];
-        try {
-            TaskGraph tg = new TaskGraph("jax4j_reduce_" + primitive + "_d_" + a.length)
-                .transferToDevice(DataTransferMode.EVERY_EXECUTION, inAd);
-            tg = switch (primitive) {
-                case SUM, MEAN -> tg.task("k", TornadoVMBackend::reduceSumD, inAd, out);
-                default -> throw new UnsupportedOperationException("No TornadoVM FP64 reduction kernel for " + primitive);
-            };
-            tg.transferToHost(DataTransferMode.EVERY_EXECUTION, out);
-
-            ImmutableTaskGraph itg = tg.snapshot();
-            TornadoExecutionPlan plan = configuredPlan(itg, device);
-            plan.execute();
-
-            CachedPlan newPlan = new CachedPlan(plan, null, null, null, inAd, null, out);
-            boundedOffer(pool, newPlan);
-
-            double[] result = new double[1];
-            result[0] = out[0];
-            if (primitive == Primitive.MEAN) {
-                result[0] /= a.length;
-            }
-            return result;
-        } catch (Throwable t) {
-            log.warn("TornadoVM FP64 reduction failed for {} on {}, falling back to host: {}", primitive, device, t.getMessage());
-            return HostBackend.INSTANCE.reduce(primitive, a, device);
-        }
+        return HostBackend.INSTANCE.reduce(primitive, a, device);
     }
 
     @Override
@@ -730,18 +645,6 @@ public class TornadoVMBackend implements ExecutionBackend {
                 for (int p = 0; p < k; p++) sum += a[i * k + p] * b[p * n + j];
                 c[i * n + j] = sum;
             }
-        }
-    }
-
-    public static void reduceSum(float[] input, @Reduce float[] result) {
-        for (@Parallel int i = 0; i < input.length; i++) {
-            result[0] += input[i];
-        }
-    }
-
-    public static void reduceSumD(double[] input, @Reduce double[] result) {
-        for (@Parallel int i = 0; i < input.length; i++) {
-            result[0] += input[i];
         }
     }
 

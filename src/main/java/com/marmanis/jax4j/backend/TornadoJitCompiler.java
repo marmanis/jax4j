@@ -225,15 +225,11 @@ public class TornadoJitCompiler {
                     int N = eq.inputs().get(1).shape().dimensions()[1];
                     tg.task(taskName, TornadoVMBackend::matmulKernel, a, b, outArr, M, K, N);
                 }
-                case SUM -> {
-                    float[] a = arrays.get(eq.inputs().get(0).id());
-                    tg.task(taskName, TornadoVMBackend::reduceSum, a, outArr);
-                }
-                case MEAN -> {
-                    float[] a = arrays.get(eq.inputs().get(0).id());
-                    tg.task(taskName, TornadoVMBackend::reduceSum, a, outArr);
-                    meanPostProcesses.add(new MeanPostProcess(outVar.id(), a.length));
-                }
+                // SUM / MEAN intentionally not JIT-fused here — the
+                // TornadoVM @Reduce path is fragile (see the comment
+                // in TornadoVMBackend#reduce). Fall through to the
+                // interpreter, which routes scalar reductions to the
+                // host backend.
                 case CAST -> {
                     float[] a = arrays.get(eq.inputs().get(0).id());
                     tg.task(taskName, TornadoVMBackend::vectorCopy, a, outArr);

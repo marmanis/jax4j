@@ -153,6 +153,125 @@ public class Grad {
         };
     }
 
+    /**
+     * Evaluates {@code fn} which returns both a primary scalar/array and auxiliary data.
+     * Differentiates strictly with respect to the primary output while passing the auxiliary
+     * data through untouched.
+     * Mirrors {@code jax.value_and_grad(fn, has_aux=True)}.
+     *
+     * @return a function returning {@code AuxResult<NDArray[], A>} where the array contains {@code [value, grad]}
+     */
+    public static <A> Function<NDArray, AuxResult<NDArray[], A>> value_and_grad_aux(Function<NDArray, AuxResult<NDArray, A>> fn) {
+        return (arg) -> {
+            Tracer.start();
+            Jaxpr jaxpr;
+            A aux;
+            try {
+                Var inVar = Tracer.current().nextVar(arg.shape(), arg.dtype());
+                AuxResult<NDArray, A> res = fn.apply(new TracedNDArray(inVar));
+                Var outVar = ((TracedNDArray) res.value()).getVar();
+                aux = res.aux();
+                jaxpr = Tracer.stop(List.of(inVar), List.of(outVar));
+            } catch (RuntimeException | Error e) {
+                Tracer.abort();
+                throw e;
+            }
+
+            Map<Integer, NDArray> fwdValues = fillForwardValues(jaxpr, List.of(arg), null);
+            NDArray value = fwdValues.get(jaxpr.outVars().get(0).id());
+            NDArray seed = ones(value.shape(), floatDtypeOrDefault(value.dtype()));
+            List<NDArray> grads = doBackward(jaxpr, fwdValues, List.of(seed), null);
+            return AuxResult.of(new NDArray[]{value, grads.get(0)}, aux);
+        };
+    }
+
+    /**
+     * Differentiates {@code fn} with auxiliary return, returning the gradient alongside the auxiliary value.
+     * Mirrors {@code jax.grad(fn, has_aux=True)}.
+     */
+    public static <A> Function<NDArray, AuxResult<NDArray, A>> grad_aux(Function<NDArray, AuxResult<NDArray, A>> fn) {
+        Function<NDArray, AuxResult<NDArray[], A>> vg = value_and_grad_aux(fn);
+        return (arg) -> {
+            AuxResult<NDArray[], A> res = vg.apply(arg);
+            return AuxResult.of(res.value()[1], res.aux());
+        };
+    }
+
+    /**
+     * Evaluates a PyTree-parameter function returning {@code AuxResult<NDArray, A>},
+     * producing both the primary loss value and the tree of gradients, paired with the auxiliary data.
+     * Mirrors {@code jax.value_and_grad(fn, has_aux=True)} on PyTrees.
+     */
+    public static <A> Function<PyTree, AuxResult<AuxResult<NDArray, PyTree>, A>> value_and_gradTree_aux(
+            Function<PyTree, AuxResult<NDArray, A>> fn) {
+        return (paramsTree) -> {
+            List<NDArray> leaves = PyTrees.flatten(paramsTree);
+
+            Tracer.start();
+            Jaxpr jaxpr;
+            List<Var> inVars = new ArrayList<>();
+            A aux;
+            try {
+                List<NDArray> tracedLeaves = new ArrayList<>();
+                for (NDArray leaf : leaves) {
+                    if (leaf == null) {
+                        tracedLeaves.add(null);
+                    } else {
+                        Var v = Tracer.current().nextVar(leaf.shape(), leaf.dtype());
+                        inVars.add(v);
+                        tracedLeaves.add(new TracedNDArray(v));
+                    }
+                }
+                PyTree tracedTree = PyTrees.unflatten(paramsTree, tracedLeaves);
+                AuxResult<NDArray, A> res = fn.apply(tracedTree);
+                Var outVar = ((TracedNDArray) res.value()).getVar();
+                aux = res.aux();
+                jaxpr = Tracer.stop(inVars, List.of(outVar));
+            } catch (RuntimeException | Error e) {
+                Tracer.abort();
+                throw e;
+            }
+
+            List<NDArray> nonNullLeaves = new ArrayList<>();
+            for (NDArray leaf : leaves) {
+                if (leaf != null) nonNullLeaves.add(leaf);
+            }
+
+            Map<Integer, NDArray> fwdValues = fillForwardValues(jaxpr, nonNullLeaves, null);
+            NDArray value = fwdValues.get(jaxpr.outVars().get(0).id());
+            Var outVar = jaxpr.outVars().get(0);
+            Device targetDevice = nonNullLeaves.isEmpty() ? Device.defaultDevice() : nonNullLeaves.get(0).device();
+            NDArray seed = ones(outVar.shape(), floatDtypeOrDefault(outVar.dtype())).to(targetDevice);
+            List<NDArray> rawGrads = doBackward(jaxpr, fwdValues, List.of(seed), null);
+
+            List<NDArray> grads = new ArrayList<>();
+            int gradsIdx = 0;
+            for (NDArray leaf : leaves) {
+                if (leaf == null) {
+                    grads.add(null);
+                } else {
+                    grads.add(rawGrads.get(gradsIdx++));
+                }
+            }
+            PyTree gradTree = PyTrees.unflatten(paramsTree, grads);
+            return AuxResult.of(AuxResult.of(value, gradTree), aux);
+        };
+    }
+
+    /**
+     * Differentiates a PyTree-parameter function returning {@code AuxResult<NDArray, A>},
+     * producing the tree of gradients paired with the auxiliary data.
+     * Mirrors {@code jax.grad(fn, has_aux=True)} on PyTrees.
+     */
+    public static <A> Function<PyTree, AuxResult<PyTree, A>> gradTree_aux(
+            Function<PyTree, AuxResult<NDArray, A>> fn) {
+        Function<PyTree, AuxResult<AuxResult<NDArray, PyTree>, A>> vg = value_and_gradTree_aux(fn);
+        return (paramsTree) -> {
+            AuxResult<AuxResult<NDArray, PyTree>, A> res = vg.apply(paramsTree);
+            return AuxResult.of(res.value().aux(), res.aux());
+        };
+    }
+
     private static List<NDArray> backward(Jaxpr jaxpr, List<NDArray> argValues) {
         Var outVar = jaxpr.outVars().get(0);
         Device targetDevice = argValues.isEmpty() ? Device.defaultDevice() : argValues.get(0).device();

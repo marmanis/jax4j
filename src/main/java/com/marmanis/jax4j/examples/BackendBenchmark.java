@@ -337,7 +337,6 @@ public class BackendBenchmark {
         return switch (t) {
             case CPU -> "CPU";
             case GPU -> "GPU";
-            case FPGA -> "FPGA";
             case ACCELERATOR -> "ACC";
             default -> t.toString();
         };

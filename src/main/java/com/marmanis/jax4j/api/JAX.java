@@ -28,6 +28,28 @@ import java.util.function.Function;
 public class JAX {
 
     /**
+     * Differentiates {@code fn} returning {@link AuxResult}, returning the gradient
+     * and the auxiliary output. Mirrors {@code jax.grad(fn, has_aux=True)}.
+     */
+    public static <A> Function<NDArray, AuxResult<NDArray, A>> grad(Function<NDArray, AuxResult<NDArray, A>> fn, boolean hasAux) {
+        if (!hasAux) {
+            throw new IllegalArgumentException("hasAux must be true when function returns AuxResult");
+        }
+        return Grad.grad_aux(fn);
+    }
+
+    /**
+     * Returns both value and gradient, plus auxiliary outputs.
+     * Mirrors {@code jax.value_and_grad(fn, has_aux=True)}.
+     */
+    public static <A> Function<NDArray, AuxResult<NDArray[], A>> value_and_grad(Function<NDArray, AuxResult<NDArray, A>> fn, boolean hasAux) {
+        if (!hasAux) {
+            throw new IllegalArgumentException("hasAux must be true when function returns AuxResult");
+        }
+        return Grad.value_and_grad_aux(fn);
+    }
+
+    /**
      * Traces a function and returns its Jaxpr.
      */
     public static Jaxpr make_jaxpr(Function<NDArray, NDArray> fn, NDArray arg) {

@@ -166,7 +166,7 @@ public class ConcreteNDArray implements NDArray {
     }
 
     public ConcreteNDArray(float[] data, Shape shape) {
-        this(new F32Storage(data), shape, Device.defaultDevice());
+        this(new F32Storage(data), shape, Device.host());
     }
 
     public ConcreteNDArray(int[] data, Shape shape, Device device) {
@@ -174,7 +174,7 @@ public class ConcreteNDArray implements NDArray {
     }
 
     public ConcreteNDArray(int[] data, Shape shape) {
-        this(new I32Storage(data), shape, Device.defaultDevice());
+        this(new I32Storage(data), shape, Device.host());
     }
 
     public ConcreteNDArray(boolean[] data, Shape shape, Device device) {
@@ -182,7 +182,7 @@ public class ConcreteNDArray implements NDArray {
     }
 
     public ConcreteNDArray(boolean[] data, Shape shape) {
-        this(new BoolStorage(data), shape, Device.defaultDevice());
+        this(new BoolStorage(data), shape, Device.host());
     }
 
     public ConcreteNDArray(double[] data, Shape shape, Device device) {
@@ -190,7 +190,7 @@ public class ConcreteNDArray implements NDArray {
     }
 
     public ConcreteNDArray(double[] data, Shape shape) {
-        this(new F64Storage(data), shape, Device.defaultDevice());
+        this(new F64Storage(data), shape, Device.host());
     }
 
     public ConcreteNDArray(long[] data, Shape shape, Device device) {
@@ -198,7 +198,7 @@ public class ConcreteNDArray implements NDArray {
     }
 
     public ConcreteNDArray(long[] data, Shape shape) {
-        this(new I64Storage(data), shape, Device.defaultDevice());
+        this(new I64Storage(data), shape, Device.host());
     }
 
     @Override public Shape shape() { return shape; }
@@ -1215,7 +1215,7 @@ public class ConcreteNDArray implements NDArray {
     }
 
     public static ConcreteNDArray fromSegment(java.lang.foreign.MemorySegment segment, Shape shape, DType dtype) {
-        return fromSegment(segment, shape, dtype, Device.defaultDevice());
+        return fromSegment(segment, shape, dtype, Device.host());
     }
 
     /**
@@ -1235,7 +1235,7 @@ public class ConcreteNDArray implements NDArray {
     }
 
     public static ConcreteNDArray allocateNative(Shape shape, DType dtype, java.lang.foreign.Arena arena) {
-        return allocateNative(shape, dtype, arena, Device.defaultDevice());
+        return allocateNative(shape, dtype, arena, Device.host());
     }
 
     @Override

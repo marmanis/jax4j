@@ -224,7 +224,7 @@ public class JAX {
             }
             List<NDArray> leaves = com.marmanis.jax4j.pytree.PyTrees.flatten(paramsTree);
             TreeSignature key = TreeSignature.of(leaves);
-            Device device = Device.defaultDevice();
+            Device device = Device.host();
             for (NDArray leaf : leaves) {
                 if (leaf != null) {
                     device = leaf.device();

@@ -1332,10 +1332,9 @@ public final class Fft {
         // host-to-device transfer plus the per-thread CUDA command-queue
         // warmup dominate the transform itself; the host radix-2 loop is
         // faster and, more importantly, cannot hang (observed on WSL). The
-        // gate is unconditional because ConcreteNDArray's 2-arg constructor
-        // places data on Device.defaultDevice() by default, so host-intent
-        // inputs look device-resident. Users who want unconditional GPU
-        // dispatch call fftOnDevice explicitly.
+        // gate is unconditional even for device-resident inputs: users who
+        // genuinely want unconditional GPU dispatch call fftOnDevice
+        // explicitly.
         if (!shouldAutoOffloadToGpu(n)) return null;
 
         Device dev = re.device();

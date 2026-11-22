@@ -30,7 +30,7 @@ public class TracedNDArray implements NDArray {
 
     @Override public Shape shape() { return var.shape(); }
     @Override public DType dtype() { return var.dtype(); }
-    @Override public Device device() { return Device.defaultDevice(); }
+    @Override public Device device() { return Device.host(); }
 
     /**
      * No-op: traced values are symbolic placeholders with no underlying data to

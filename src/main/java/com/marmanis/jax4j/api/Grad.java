@@ -147,7 +147,7 @@ public class Grad {
             Jaxpr jaxpr = JAX.make_jaxpr(fn, arg);
             Map<Integer, NDArray> fwdValues = fillForwardValues(jaxpr, List.of(arg), null);
             NDArray value = fwdValues.get(jaxpr.outVars().get(0).id());
-            NDArray seed = ones(value.shape(), floatDtypeOrDefault(value.dtype()));
+            NDArray seed = ones(value.shape(), floatDtypeOrDefault(value.dtype()), value.device());
             List<NDArray> grads = doBackward(jaxpr, fwdValues, List.of(seed), null);
             return new NDArray[]{value, grads.get(0)};
         };
@@ -179,7 +179,7 @@ public class Grad {
 
             Map<Integer, NDArray> fwdValues = fillForwardValues(jaxpr, List.of(arg), null);
             NDArray value = fwdValues.get(jaxpr.outVars().get(0).id());
-            NDArray seed = ones(value.shape(), floatDtypeOrDefault(value.dtype()));
+            NDArray seed = ones(value.shape(), floatDtypeOrDefault(value.dtype()), value.device());
             List<NDArray> grads = doBackward(jaxpr, fwdValues, List.of(seed), null);
             return AuxResult.of(new NDArray[]{value, grads.get(0)}, aux);
         };
@@ -240,7 +240,7 @@ public class Grad {
             Map<Integer, NDArray> fwdValues = fillForwardValues(jaxpr, nonNullLeaves, null);
             NDArray value = fwdValues.get(jaxpr.outVars().get(0).id());
             Var outVar = jaxpr.outVars().get(0);
-            Device targetDevice = nonNullLeaves.isEmpty() ? Device.defaultDevice() : nonNullLeaves.get(0).device();
+            Device targetDevice = nonNullLeaves.isEmpty() ? Device.host() : nonNullLeaves.get(0).device();
             NDArray seed = ones(outVar.shape(), floatDtypeOrDefault(outVar.dtype())).to(targetDevice);
             List<NDArray> rawGrads = doBackward(jaxpr, fwdValues, List.of(seed), null);
 
@@ -274,7 +274,7 @@ public class Grad {
 
     private static List<NDArray> backward(Jaxpr jaxpr, List<NDArray> argValues) {
         Var outVar = jaxpr.outVars().get(0);
-        Device targetDevice = argValues.isEmpty() ? Device.defaultDevice() : argValues.get(0).device();
+        Device targetDevice = argValues.isEmpty() ? Device.host() : argValues.get(0).device();
         NDArray seed = ones(outVar.shape(), floatDtypeOrDefault(outVar.dtype())).to(targetDevice);
         return backwardInterpret(jaxpr, argValues, List.of(seed));
     }
@@ -351,7 +351,7 @@ public class Grad {
             NDArray g = grads.get(inVar.id());
             if (g == null) {
                 NDArray inputVal = values.get(inVar.id());
-                Device dev = (inputVal != null) ? inputVal.device() : Device.defaultDevice();
+                Device dev = (inputVal != null) ? inputVal.device() : Device.host();
                 g = zeros(inVar.shape(), floatDtypeOrDefault(inVar.dtype())).to(dev);
             }
             result.add(g);
@@ -361,7 +361,7 @@ public class Grad {
 
     /** The forward pass shared by {@link #forwardInterpret} and {@link #backwardInterpret}. */
     private static Map<Integer, NDArray> fillForwardValues(Jaxpr jaxpr, List<NDArray> argValues, Map<Integer, NDArray> parentValues) {
-        Device targetDevice = argValues.isEmpty() ? Device.defaultDevice() : argValues.get(0).device();
+        Device targetDevice = argValues.isEmpty() ? Device.host() : argValues.get(0).device();
         Map<Integer, NDArray> values = new HashMap<>();
         if (parentValues != null) {
             values.putAll(parentValues);
@@ -1418,19 +1418,19 @@ public class Grad {
                 return tangents[0].mul(primals[0].cos());
             }
             case COS -> {
-                return tangents[0].mul(primals[0].sin()).mul(minusOne(shape, dtype));
+                return tangents[0].mul(primals[0].sin()).mul(minusOne(shape, dtype, primalOut.device()));
             }
             case TANH -> {
                 NDArray t = primalOut;
-                return tangents[0].mul(ones(shape, dtype).sub(t.mul(t)));
+                return tangents[0].mul(ones(shape, dtype, primalOut.device()).sub(t.mul(t)));
             }
             case RELU -> {
-                NDArray zero = zeros(primals[0].shape(), primals[0].dtype());
+                NDArray zero = zeros(primals[0].shape(), primals[0].dtype()).to(primals[0].device());
                 return tangents[0].mul(primals[0].gt(zero).astype(primals[0].dtype()));
             }
             case SIGMOID -> {
                 NDArray s = primalOut;
-                return tangents[0].mul(s.mul(ones(shape, dtype).sub(s)));
+                return tangents[0].mul(s.mul(ones(shape, dtype, primalOut.device()).sub(s)));
             }
             case DOT -> {
                 return tangents[0].dot(primals[1]).add(primals[0].dot(tangents[1]));
@@ -1515,7 +1515,7 @@ public class Grad {
     }
 
     private static NDArray scalar(double v, DType dtype) {
-        return scalar(v, dtype, Device.defaultDevice());
+        return scalar(v, dtype, Device.host());
     }
 
     private static NDArray scalar(double v, DType dtype, Device device) {
@@ -1527,7 +1527,7 @@ public class Grad {
     }
 
     private static NDArray ones(Shape shape, DType dtype) {
-        return ones(shape, dtype, Device.defaultDevice());
+        return ones(shape, dtype, Device.host());
     }
 
     private static NDArray ones(Shape shape, DType dtype, Device device) {
@@ -1664,7 +1664,7 @@ public class Grad {
     }
 
     private static NDArray minusOne(Shape shape, DType dtype) {
-        return minusOne(shape, dtype, Device.defaultDevice());
+        return minusOne(shape, dtype, Device.host());
     }
 
     private static NDArray minusOne(Shape shape, DType dtype, Device device) {

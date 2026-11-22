@@ -2,6 +2,7 @@ package com.marmanis.jax4j;
 
 import com.marmanis.jax4j.api.JAX;
 import com.marmanis.jax4j.core.ConcreteNDArray;
+import com.marmanis.jax4j.core.DType;
 import com.marmanis.jax4j.core.Device;
 import com.marmanis.jax4j.core.NDArray;
 import com.marmanis.jax4j.core.Shape;
@@ -63,11 +64,16 @@ public class Phase3FeaturesTest {
         PartitionSpec inSpec = PartitionSpec.of("data");
         PartitionSpec outSpec = PartitionSpec.of("data");
 
-        // Global input: [4 elements] -> sharded into 2 shards of [2 elements] each
-        NDArray input = new ConcreteNDArray(new float[]{1f, 2f, 3f, 4f}, new Shape(4));
+        // Global input: [4 elements] -> sharded into 2 shards of [2 elements] each.
+        // Place on host so the shards and the constant below share a device; under
+        // TornadoVM, Device.defaultDevice() is a GPU, and mixing it with the
+        // host-only mesh raises IllegalStateException in elementwise ops.
+        NDArray input = new ConcreteNDArray(new float[]{1f, 2f, 3f, 4f}, new Shape(4), DType.FLOAT32, Device.host());
 
-        // SPMD function: computes x * 10 elementwise on each shard
-        Function<NDArray, NDArray> fn = x -> x.mul(new ConcreteNDArray(new float[]{10f}, new Shape(1)));
+        // SPMD function: computes x * 10 elementwise on each shard. Scalar lives
+        // on the shard's device (host), matching x after ShardMap places it there.
+        Function<NDArray, NDArray> fn = x ->
+                x.mul(new ConcreteNDArray(new float[]{10f}, new Shape(1), DType.FLOAT32, Device.host()));
 
         Function<NDArray, NDArray> shardedFn = JAX.shard_map(fn, mesh, inSpec, outSpec);
         NDArray output = shardedFn.apply(input);
@@ -89,10 +95,12 @@ public class Phase3FeaturesTest {
                 3f, 3f,
                 4f, 4f
         };
-        NDArray input = new ConcreteNDArray(data, new Shape(4, 2));
+        NDArray input = new ConcreteNDArray(data, new Shape(4, 2), DType.FLOAT32, Device.host());
 
-        // Function: add 100 to all local elements
-        Function<NDArray, NDArray> fn = x -> x.add(new ConcreteNDArray(new float[]{100f}, new Shape(1)));
+        // Function: add 100 to all local elements. Constant placed on host to
+        // match the host-only mesh (see testShardMapSPMDExecution for rationale).
+        Function<NDArray, NDArray> fn = x ->
+                x.add(new ConcreteNDArray(new float[]{100f}, new Shape(1), DType.FLOAT32, Device.host()));
 
         NDArray output = ShardMap.shardMap(fn, mesh, inSpec, outSpec).apply(input);
 

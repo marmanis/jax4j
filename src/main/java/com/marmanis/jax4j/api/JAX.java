@@ -28,9 +28,17 @@ import java.util.function.Function;
 public class JAX {
 
     /**
-     * Differentiates {@code fn} returning {@link AuxResult}, returning the gradient
-     * and the auxiliary output. Mirrors {@code jax.grad(fn, has_aux=True)}.
+     * Executes {@code fn} across a {@link com.marmanis.jax4j.sharding.DeviceMesh} in SPMD style
+     * according to the specified input and output {@link com.marmanis.jax4j.sharding.PartitionSpec}s.
+     * Mirrors {@code jax.experimental.shard_map}.
      */
+    public static Function<NDArray, NDArray> shard_map(
+            Function<NDArray, NDArray> fn,
+            com.marmanis.jax4j.sharding.DeviceMesh mesh,
+            com.marmanis.jax4j.sharding.PartitionSpec inSpec,
+            com.marmanis.jax4j.sharding.PartitionSpec outSpec) {
+        return com.marmanis.jax4j.sharding.ShardMap.shardMap(fn, mesh, inSpec, outSpec);
+    }
     public static <A> Function<NDArray, AuxResult<NDArray, A>> grad(Function<NDArray, AuxResult<NDArray, A>> fn, boolean hasAux) {
         if (!hasAux) {
             throw new IllegalArgumentException("hasAux must be true when function returns AuxResult");

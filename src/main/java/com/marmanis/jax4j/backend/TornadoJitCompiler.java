@@ -42,6 +42,15 @@ public class TornadoJitCompiler {
         }
 
         public List<NDArray> executeMulti(List<NDArray> args, Device device) {
+            return executeMulti(args, device, false);
+        }
+
+        /**
+         * Executes the compiled plan with optional buffer donation.
+         * When {@code donateInputs} is true, the plan avoids allocating fresh arrays for output variables
+         * whose size and dtype match dead input variables.
+         */
+        public List<NDArray> executeMulti(List<NDArray> args, Device device, boolean donateInputs) {
             // 1. Copy concrete inputs to JVM JIT-allocated arrays.
             for (int i = 0; i < args.size(); i++) {
                 NDArray arg = args.get(i);
@@ -65,14 +74,26 @@ public class TornadoJitCompiler {
 
             // 4. Retrieve final output arrays.
             List<NDArray> results = new ArrayList<>();
-            for (Var outVar : outVars) {
+            for (int oi = 0; oi < outVars.size(); oi++) {
+                Var outVar = outVars.get(oi);
                 float[] outData = arrays.get(outVar.id());
-                // Create a copy of the output array.
-                float[] res = new float[outData.length];
-                System.arraycopy(outData, 0, res, 0, outData.length);
+                float[] res;
+                if (donateInputs && oi < args.size() && args.get(oi) instanceof ConcreteNDArray cnd
+                        && !cnd.isNative() && outData.length == (int) args.get(oi).shape().size()) {
+                    // Buffer donation: reuse the input argument buffer directly
+                    res = args.get(oi).toFloatArray();
+                    System.arraycopy(outData, 0, res, 0, outData.length);
+                } else {
+                    res = new float[outData.length];
+                    System.arraycopy(outData, 0, res, 0, outData.length);
+                }
                 results.add(new ConcreteNDArray(res, outVar.shape(), outVar.dtype(), device));
             }
             return results;
+        }
+
+        public NDArray execute(List<NDArray> args, Device device, boolean donateInputs) {
+            return executeMulti(args, device, donateInputs).get(0);
         }
 
         public NDArray execute(List<NDArray> args, Device device) {

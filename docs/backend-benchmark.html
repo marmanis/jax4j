@@ -713,6 +713,93 @@
     </section>
 
     <section>
+        <h2>Navier–Stokes 3-D — end-to-end, host vs cuFFT</h2>
+        <p style="margin-top: 0; color: var(--text-muted); max-width: 66ch;">
+            HB4J's periodic-cube spectral solver (chebfun4j), which does
+            <span class="figure" style="font-family: var(--font-mono); color: var(--text);">9</span>
+             real-3-D FFTs per timestep (6 inverse, 3 forward) alongside a fixed
+            block of host-side spectral algebra. Same simulation, same
+            <span class="figure" style="font-family: var(--font-mono); color: var(--text);">dt</span>,
+            same iteration count &mdash; only the FFT backend changes.
+        </p>
+        <table style="margin-top: 20px;">
+            <thead>
+                <tr>
+                    <th>Grid</th>
+                    <th><span class="col-swatch" style="background: var(--c-cpujava);"></span>Host s/iter</th>
+                    <th><span class="col-swatch" style="background: var(--c-gpu);"></span>GPU s/iter</th>
+                    <th>Speed-up</th>
+                    <th>GPU warmup</th>
+                    <th>Iters</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>64³</td>
+                    <td>0.088</td>
+                    <td class="peak">0.065</td>
+                    <td class="speedup">1.35×</td>
+                    <td>0.88 s</td>
+                    <td>30</td>
+                </tr>
+                <tr>
+                    <td>128³</td>
+                    <td>0.492</td>
+                    <td class="peak">0.331</td>
+                    <td class="speedup">1.49×</td>
+                    <td>1.46 s</td>
+                    <td>20</td>
+                </tr>
+            </tbody>
+        </table>
+        <p class="footnote">
+            <sup>a</sup>Steady-state average excludes the first iteration
+            (JIT + one-shot cuFFT plan build). <sup>b</sup>GPU warmup is the
+            time cost of the first iteration, dominated by the cached
+            <span class="figure" style="font-family: var(--font-mono); color: var(--text);">TornadoExecutionPlan</span>
+            construction &mdash; amortized across the whole run.
+        </p>
+        <div class="obs" style="margin-top: 28px;">
+            <div class="obs-card">
+                <h3>Speed-up grows with grid</h3>
+                <p>
+                    From <span class="figure">1.35×</span> at 64³ to
+                    <span class="figure">1.49×</span> at 128³. cuFFT scales
+                    better than the host radix-2 loop as the axis size
+                    grows, but the ceiling is set by non-FFT work.
+                </p>
+            </div>
+            <div class="obs-card">
+                <h3>The Amdahl ceiling</h3>
+                <p>
+                    Per 128³ iteration, host time is
+                    <span class="figure">492 ms</span> and GPU time is
+                    <span class="figure">331 ms</span>. The
+                    <span class="figure">~161 ms</span> we saved is the
+                    FFT budget moved to the GPU. The remaining
+                    <span class="figure">~330 ms</span> is host-side spectral
+                    algebra &mdash; vorticity curl, Lamb-vector cross product,
+                    de-aliasing filter, stiffly-stable marching. Even a
+                    zero-cost FFT would cap the total speed-up near 1.5×
+                    on this solver.
+                </p>
+            </div>
+            <div class="obs-card">
+                <h3>Plan cache is essential</h3>
+                <p>
+                    An early version created a fresh
+                    <span class="figure" style="font-family: var(--font-mono); color: var(--text);">TaskGraph</span>
+                    per dispatch, and OOMed on the second iteration &mdash;
+                    cuFFT's per-plan workspace is not reclaimed by TornadoVM's
+                    <span class="figure" style="font-family: var(--font-mono); color: var(--text);">freeDeviceMemory</span>.
+                    Caching one plan per (shape, direction) keeps device
+                    memory flat across the entire run.
+                </p>
+            </div>
+        </div>
+    </section>
+
+    <section>
         <h2>System under test</h2>
         <div class="setup">
             <dl>

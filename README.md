@@ -5,7 +5,14 @@
 ## Features
 
 - **Functional IR (Jaxpr)**: Computations are traced into a simplified intermediate representation for transformation and optimization.
-- **Automatic Differentiation**: Reverse-mode AD via `grad`, including multi-argument gradients (`argnums`), gradients over nested parameter pytrees, and higher-order gradients (`grad(grad(f))`).
+- **Automatic Differentiation**: Reverse-mode AD via `grad`, including multi-argument gradients (`argnums`), gradients over nested parameter pytrees, and higher-order gradients (`grad(grad(f))`). Supports **`has_aux`** via `JAX.grad(fn, hasAux)` and `JAX.value_and_grad(fn, hasAux)` to return non-differentiated auxiliary outputs (e.g. intermediate activations, metrics, model state) alongside the loss/gradient as `AuxResult<NDArray, A>` or `AuxResult<PyTree, A>`. Custom Vector-Jacobian Products (VJPs) can be declared cleanly via the fluent **`CustomVjp`** builder (`CustomVjp.defvjp(...)`).
+- **PRNGSequence & Modern Neural Modules**: In addition to stateless `PRNGKey` and `Random.split`, `PRNGSequence.of(seed)` provides an ergonomic, reproducible key stream for training loops. Neural network primitives in `com.marmanis.jax4j.ml` include modern architectures such as **`RMSNorm`** (Root Mean Square Normalization, widely used in modern LLMs) alongside `LayerNorm`, `Linear`, `Dropout`, and `Embedding`.
+- **Off-Heap Storage & Zero-Copy FFM (Project Panama)**: Native tensor storage (`NativeStorage`) backed by Java's Foreign Function & Memory (FFM) API (`java.lang.foreign.MemorySegment`). Enables zero-copy memory exchange with native C/C++ libraries, BLAS/LAPACK, and accelerator drivers via `NDArray.asMemorySegment()` and `NDArray.isNative()`. Explicit off-heap allocation is available through `ConcreteNDArray.allocateNative(shape, dtype)` and `ConcreteNDArray.fromSegment(segment, shape, dtype)`. Includes buffer donation optimizations (`donateInputs`) in `TornadoJitCompiler` for in-place device memory reuse.
+- **Next-Gen Distributed Compute & Named Sharding (SPMD)**: Full SPMD (Single Program, Multiple Data) distributed execution model mirroring JAX's modern sharding architecture:
+  - `DeviceMesh`: Logical N-dimensional device grid with named axes (e.g. `data`, `model`).
+  - `PartitionSpec`: Declarative mapping of array dimensions to mesh axes (e.g. `PartitionSpec.of("data", null)`).
+  - `NamedSharding`: First-class association of a `DeviceMesh` and `PartitionSpec`.
+  - `JAX.shard_map`: SPMD function transformation that slices global inputs according to input partition specs, executes the kernel on each shard concurrently, and reassembles the global output according to the output partition spec.
 - **Data-parallel execution (`pmap`)**: `JAX.pmap(fn, devices)` splits the input's leading axis across a list of devices (one shard per device), runs `fn` on each shard concurrently, and stacks the results back — mirroring `jax.pmap` with `in_axes=0, out_axes=0`. Collective ops inside the body: `Lax.psum(x)` all-reduces (sums) across devices; `Lax.allGather(x, numDevices)` gathers all shards and returns the full stacked array to every device. Both collectives use a two-phase `CyclicBarrier` (deposit → read → release) so that sequential collectives within the same body never race. Fully compose with `grad`: `JAX.grad(x -> JAX.pmap(f, devices).apply(x).sum())` differentiates through the pmap via a `PMAP` primitive whose VJP runs the backward pass on each shard concurrently — and the VJP of `psum` is itself a `psum` (the correct linear-map transpose: each replica's input x_i contributed to every other replica's psum output, so the incoming gradient must also be all-reduced). Without real hardware, pass `List.of(new Device(null), new Device(null))` for two host-backed synthetic shards — all sharding and collective logic is exercised identically on the CPU. Also composes with `vmap`: `vmap(x -> pmap(f, D)(x))` runs pmap independently per batch element.
 - **Automatic Batching (`vmap`)**: Vectorizes a function written for a single example over a leading batch dimension, with per-primitive batching rules (elementwise ops, reductions, and matrix multiply).
 - **Pytrees**: Nested `List`/`Map<String, _>` containers of `NDArray` leaves that `grad` and other transforms can flatten, map, and rebuild — for working with structured parameter sets (e.g. `{"w": ..., "b": ...}`) instead of single flat arrays.
@@ -19,7 +26,7 @@
 - **Control flow**: `com.marmanis.jax4j.api.Lax` mirrors `jax.lax`'s `cond`/`while_loop`/`scan`/`fori_loop`. Unlike a plain Java `if`/`for` wrapped around traced ops, `cond` and `scan` record themselves as a single equation in the surrounding Jaxpr (with the branch/step functions traced into their own nested Jaxprs), so they're real, differentiable parts of the computation graph under `grad`/`gradTree` rather than being unrolled away outside it — `scan`'s backward pass is itself an internal reverse scan over the step function, mirroring how JAX differentiates `lax.scan`. `while_loop` has no VJP and is not reverse-mode differentiable (its iteration count is data-dependent), exactly like upstream `jax.lax.while_loop`. `fori_loop`'s bound is a plain Java `int`, so it's simply unrolled — already fully traceable with no new primitive needed.
 - **FFT / DCT-I (`com.marmanis.jax4j.api.Fft`)**: Iterative radix-2 Cooley-Tukey `fft`/`ifft` on complex FLOAT32 or FLOAT64 inputs (length a power of two), plus `dctI` — the real transform Chebyshev value/coefficient conversions use — built on top of the FFT via the length-`2(N-1)` mirror trick. Host-only for now (no TornadoVM kernel, no VJP/vmap rules; treated as a numerical primitive alongside `CAST`/gather). Powers the sibling [chebfun4j](../chebfun4j) project's values ↔ coefficients transform.
 - **Trace caching (`JAX.jit` / `JAX.jitGrad` / `JAX.jitGradTree`)**: `JAX.jit(fn)` wraps a function so it is traced once per distinct `(shape, dtype)` input signature and executed via a Jaxpr interpreter on subsequent calls — the tracing cost is paid on the first call at each new signature, later calls skip straight to `Grad.forwardInterpret`. `JAX.jitGrad(fn)` and `JAX.jitGradTree(fn)` do the same for reverse-mode AD: they cache the *traced* Jaxpr and reuse it, running `Grad.backwardInterpret` per call. Both are transparent under nested tracing (a jitted call inside `JAX.grad` falls through eagerly so the outer trace records ops correctly). `Grad.forwardInterpret` and `Grad.backwardInterpret` are also exposed publicly for consumers who want to trace once manually and interpret many times (see chebfun4j's `NonlinearChebop.AutodiffBatched`).
-- **Java 24+ Optimized**: Built with modern Java features like records and improved JIT for maximum efficiency.
+- **Java 27+ Optimized**: Built with modern Java 27 features including records, pattern matching, Project Panama Foreign Function & Memory (FFM) API (`MemorySegment`), and native access optimizations.
 - **Seamless Integration**: Familiar NumPy-like API for NDArray operations.
 
 Not yet implemented:
@@ -36,11 +43,17 @@ Not yet implemented:
 
 ## Core Abstractions
 
-- `NDArray`: The primary data structure for N-dimensional arrays.
+- `NDArray`: The primary data structure for N-dimensional arrays (supports `FLOAT32`, `FLOAT64`, `INT32`, `INT64`, `BOOL`, with both on-heap and off-heap `NativeStorage`).
 - `Shape`: Immutable representation of array dimensions, with NumPy-style broadcasting (`Shape.broadcast`).
-- `JAX`: Entry point for transformations (`jit`, `grad`, `gradTree`, `vmap`).
-- `Jaxpr`: A sequence of primitive equations representing a traced function.
+- `JAX`: Entry point for functional transformations (`jit`, `grad`, `value_and_grad`, `vmap`, `pmap`, `shard_map`).
+- `Jaxpr`: A sequence of primitive equations representing a traced computation graph.
 - `PyTree`: A nested `List`/`Map<String, _>` container of `NDArray` leaves (see `com.marmanis.jax4j.pytree`).
+- `AuxResult`: Container holding the primary result, gradient, and non-differentiated auxiliary data (`has_aux`).
+- `CustomVjp`: Declarative builder for custom forward and backward vector-Jacobian products.
+- `PRNGKey` / `PRNGSequence`: Stateless keys and stateful key streams for reproducible pseudorandom generation.
+- `DeviceMesh` / `PartitionSpec` / `NamedSharding`: Declarative multidimensional SPMD device topology and sharding specifications.
+- `com.marmanis.jax4j.ml`: Equinox-style neural network layers (`Linear`, `RMSNorm`, `LayerNorm`, `Dropout`, etc.) and optimizers.
+- `com.marmanis.jax4j.keras`: High-level Sequential and Functional neural network API.
 
 ## Usage Example: Linear Regression
 
@@ -105,10 +118,75 @@ NDArray result = a.mul(b); // runs on gpu
 NDArray[] shardResults = MultiDevice.map(devices, shards, shard -> shard.mul(shard));
 ```
 
+## Usage Example: Auxiliary Outputs with `has_aux`
+
+```java
+// Differentiate a function returning both loss and auxiliary metadata (e.g. state, metrics)
+Function<NDArray, AuxResult<NDArray, Map<String, Object>>> trainStep = w -> {
+    NDArray loss = w.mul(w).mean();
+    Map<String, Object> metrics = Map.of("accuracy", 0.985, "epoch", 1);
+    return new AuxResult<>(loss, metrics);
+};
+
+// Compute both loss value, gradient, and auxiliary metrics in a single pass
+AuxResult<NDArray, Map<String, Object>> result = JAX.value_and_grad(trainStep, true).apply(w);
+NDArray lossVal = result.primary();
+NDArray gradVal = result.gradient();
+Map<String, Object> aux = result.aux();
+```
+
+## Usage Example: Custom Vector-Jacobian Products (`CustomVjp`)
+
+```java
+// Define custom forward and backward passes with residual stashing
+Function<NDArray, NDArray> safeSqrt = CustomVjp.defvjp((NDArray x) -> x.sqrt())
+    .fwd(x -> new CustomVjp.FwdResidual<>(x.sqrt(), x))
+    .bwd((res, g) -> {
+        NDArray x = res.residual();
+        return g.div(x.sqrt().mul(2.0f));
+    })
+    .build();
+
+NDArray grad = JAX.grad(safeSqrt).apply(NDArray.of(4.0f)); // 0.25
+```
+
+## Usage Example: Off-Heap Memory & Project Panama (FFM)
+
+```java
+// Allocate native off-heap storage or bridge from an existing foreign MemorySegment
+NDArray nativeArr = ConcreteNDArray.allocateNative(Shape.of(1024, 1024), DType.FLOAT32);
+assertTrue(nativeArr.isNative());
+
+// Zero-copy access for native BLAS, C/C++ libraries, or accelerator buffers
+java.lang.foreign.MemorySegment segment = nativeArr.asMemorySegment();
+```
+
+## Usage Example: Next-Gen SPMD Distributed Sharding (`shard_map`)
+
+```java
+// Create a logical 1D or 2D mesh of accelerator devices
+DeviceMesh mesh = new DeviceMesh(new int[]{2}, new String[]{"data"}, devices);
+
+// Map global arrays across mesh axes declaratively
+PartitionSpec inSpec = PartitionSpec.of("data");
+PartitionSpec outSpec = PartitionSpec.of("data");
+
+// Transform local kernel into a distributed SPMD execution
+Function<NDArray, NDArray> spmdFn = JAX.shard_map(
+    shard -> shard.mul(2.0f),
+    mesh,
+    List.of(inSpec),
+    outSpec
+);
+
+NDArray globalOutput = spmdFn.apply(globalInput);
+```
+
 ## Setup and Requirements
 
-- **JDK**: Java 24 or higher.
-- **TornadoVM**: Ensure the TornadoVM SDK is installed and configured in your environment to enable hardware acceleration.
+- **JDK**: Java 27 or higher (tested with Amazon Corretto 27 in WSL).
+- **Project Panama FFM**: Requires `--enable-native-access=ALL-UNNAMED` when running on the JVM (pre-configured in `pom.xml` for Surefire tests).
+- **TornadoVM**: Ensure the TornadoVM SDK is installed and configured in your environment to enable GPU/heterogeneous hardware acceleration.
 - **Maven**: Standard Maven build system.
 
 ### Selecting a TornadoVM backend in the examples
@@ -180,24 +258,41 @@ in every `ConcreteNDArray` path already.
 
 ## Project Structure
 
-- `com.marmanis.jax4j.core`: Fundamental data structures.
-- `com.marmanis.jax4j.ir`: Intermediate Representation (Jaxpr).
-- `com.marmanis.jax4j.tracing`: Tracing system for capturing Java functions.
-- `com.marmanis.jax4j.api`: High-level JAX transformations (`JAX`, `Grad`, `Vmap`, `FFI`).
-- `com.marmanis.jax4j.pytree`: Pytree containers and flatten/unflatten/map utilities.
-- `com.marmanis.jax4j.backend`: TornadoVM compilation and execution.
+- `com.marmanis.jax4j.core`: Fundamental data structures (`NDArray`, `Shape`, `DType`, `ConcreteNDArray`, `NativeStorage`).
+- `com.marmanis.jax4j.ir`: Intermediate Representation (`Jaxpr`, `JaxprEquation`, `Primitive`).
+- `com.marmanis.jax4j.tracing`: Tracing system for capturing Java functions (`TracedNDArray`, `TraceContext`).
+- `com.marmanis.jax4j.api`: High-level JAX transformations (`JAX`, `Grad`, `Vmap`, `CustomVjp`, `AuxResult`, `Random`, `PRNGSequence`, `Lax`, `Numpy`, `Nn`, `Fft`).
+- `com.marmanis.jax4j.pytree`: Pytree containers and flatten/unflatten/map utilities (`PyTree`, `PyTrees`).
+- `com.marmanis.jax4j.sharding`: Next-gen SPMD distributed compute and named sharding (`DeviceMesh`, `PartitionSpec`, `NamedSharding`, `ShardMap`).
+- `com.marmanis.jax4j.ml`: Equinox-style neural network modules (`Linear`, `RMSNorm`, `LayerNorm`, `Dropout`, `Embedding`, `MLP`, `Sequential`) and optimizers (`Adam`, `AdamW`, `SGD`).
+- `com.marmanis.jax4j.keras`: High-level Keras Sequential and Functional API (`Model`, `Input`, layers, optimizers, callbacks, losses, metrics).
+- `com.marmanis.jax4j.backend`: TornadoVM compilation, buffer donation, and execution.
 
 ## Testing
 
-Run the test suite using Maven:
+Run the test suite using Maven (in WSL with JDK 27):
 ```bash
+# Run complete test suite (disabling the hardware-specific TornadoVM profile when GPU is absent)
+mvn test -P-tornado
+
+# Run with full TornadoVM hardware acceleration enabled
 mvn test
 ```
 
-The tests cover:
-- Tracing correctness.
-- Automatic differentiation accuracy (via `GradTest`).
-- NDArray arithmetic.
+The comprehensive test suite (375+ tests) covers:
+- Core array arithmetic, broadcasting, slicing, and reshaping.
+- Project Panama FFM off-heap memory allocation and zero-copy segment sharing.
+- Tracing correctness and intermediate representation (Jaxpr).
+- Automatic differentiation accuracy, higher-order derivatives, and `has_aux` aux-returns.
+- Custom vector-Jacobian products (`CustomVjp`).
+- Automatic batching (`vmap`) and multi-device parallelism (`pmap`).
+- SPMD distributed sharding (`DeviceMesh`, `PartitionSpec`, `NamedSharding`, `shard_map`).
+- Equinox-style `com.marmanis.jax4j.ml` modules and Keras-style models.
+
+## Changelogs & Modernization
+
+- [CHANGES-2026-11.md](CHANGES-2026-11.md): Architectural modernization, `has_aux`, `CustomVjp`, `PRNGSequence`, `RMSNorm`, Project Panama FFM off-heap memory, SPMD named sharding (`shard_map`), and JDK 27 upgrade.
+- [CHANGES-2026-08-04-to-2026-08-14.md](CHANGES-2026-08-04-to-2026-08-14.md): Earlier milestone changes including GPU FFT bridge, ML foundations, Keras-style API, and GAP-1 through GAP-6 upgrades.
 
 ## License
 

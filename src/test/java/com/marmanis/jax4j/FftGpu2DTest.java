@@ -185,12 +185,21 @@ public class FftGpu2DTest {
         double[] him = randomVector(n0 * n1, 43L);
         Shape sh = new Shape(n0, n1);
 
-        double[][] ref = naiveDft2(hre, him, n0, n1, false);
-        NDArray[] auto = Fft.fft2(
-            new ConcreteNDArray(hre.clone(), sh),   // host-resident
-            new ConcreteNDArray(him.clone(), sh));
-        assertOnGpu(auto[0], "auto-dispatch fft2 from host");
-        assertCloseAbs(ref[0], auto[0].toDoubleArray(), TOL_F64, "auto fft2 re");
-        assertCloseAbs(ref[1], auto[1].toDoubleArray(), TOL_F64, "auto fft2 im");
+        // 8×16 is below Fft.DEFAULT_CUFFT_AUTO_OFFLOAD_MIN_ELEMENTS. Drop the
+        // threshold for this test to exercise the dispatch code path.
+        String prev = System.getProperty("jax4j.fft.cufftAutoOffloadMinElements");
+        System.setProperty("jax4j.fft.cufftAutoOffloadMinElements", "0");
+        try {
+            double[][] ref = naiveDft2(hre, him, n0, n1, false);
+            NDArray[] auto = Fft.fft2(
+                new ConcreteNDArray(hre.clone(), sh),   // host-resident
+                new ConcreteNDArray(him.clone(), sh));
+            assertOnGpu(auto[0], "auto-dispatch fft2 from host");
+            assertCloseAbs(ref[0], auto[0].toDoubleArray(), TOL_F64, "auto fft2 re");
+            assertCloseAbs(ref[1], auto[1].toDoubleArray(), TOL_F64, "auto fft2 im");
+        } finally {
+            if (prev == null) System.clearProperty("jax4j.fft.cufftAutoOffloadMinElements");
+            else System.setProperty("jax4j.fft.cufftAutoOffloadMinElements", prev);
+        }
     }
 }

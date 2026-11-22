@@ -136,6 +136,19 @@ public interface NDArray {
     long[] toLongArray();
 
     /**
+     * Returns a native {@link java.lang.foreign.MemorySegment} viewing the underlying buffer
+     * for zero-copy native C / CUDA / DLPack interop (Project Panama / JEP 454).
+     */
+    java.lang.foreign.MemorySegment asMemorySegment();
+
+    /**
+     * Returns true if this array's backing store is off-heap native memory.
+     */
+    default boolean isNative() {
+        return false;
+    }
+
+    /**
      * Returns a view with the same data but a different shape, mirroring
      * {@code jax.numpy.reshape}. The total number of elements must be
      * unchanged. Works for all dtypes.

@@ -268,4 +268,9 @@ public class TracedNDArray implements NDArray {
     public long[] toLongArray() {
         throw new UnsupportedOperationException("Cannot get data from a traced array. You must JIT compile it first.");
     }
+
+    @Override
+    public java.lang.foreign.MemorySegment asMemorySegment() {
+        throw new UnsupportedOperationException("Cannot get memory segment from a traced array. You must JIT compile it first.");
+    }
 }

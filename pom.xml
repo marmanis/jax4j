@@ -9,8 +9,8 @@
     <version>1.0-SNAPSHOT</version>
 
     <properties>
-        <!-- Java 25, matching the other modules (required for TornadoVM). -->
-        <maven.compiler.release>25</maven.compiler.release>
+        <!-- Java 27, targeting OpenJDK 27 with Panama FFM and modern SIMD / JVMCI features. -->
+        <maven.compiler.release>27</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <tornadovm.version>8.1.0-jdk22plus</tornadovm.version>
         <junit.version>5.10.2</junit.version>
@@ -84,6 +84,9 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
+                <configuration>
+                    <argLine>--enable-native-access=ALL-UNNAMED</argLine>
+                </configuration>
             </plugin>
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>

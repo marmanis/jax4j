@@ -87,6 +87,65 @@ public class ConcreteNDArray implements NDArray {
         @Override public String dataString() { return Arrays.toString(data); }
     }
 
+    /**
+     * Storage backed by an off-heap or native {@link java.lang.foreign.MemorySegment} (Project Panama / JEP 454).
+     */
+    private record NativeStorage(java.lang.foreign.MemorySegment segment, DType dtype) implements Storage {
+        @Override
+        public boolean dataEquals(Storage o) {
+            if (o instanceof NativeStorage ns) {
+                return dtype == ns.dtype && segment.byteSize() == ns.segment.byteSize()
+                        && java.util.Arrays.equals(toFloatArray(), ns.toFloatArray());
+            }
+            return false;
+        }
+
+        @Override
+        public int dataHashCode() {
+            return Long.hashCode(segment.byteSize()) * 31 + dtype.hashCode();
+        }
+
+        @Override
+        public String dataString() {
+            return "NativeSegment(" + dtype + ", bytes=" + segment.byteSize() + ")";
+        }
+
+        public float[] toFloatArray() {
+            int n = (int) (segment.byteSize() / java.lang.foreign.ValueLayout.JAVA_FLOAT.byteSize());
+            float[] arr = new float[n];
+            java.lang.foreign.MemorySegment.copy(segment, java.lang.foreign.ValueLayout.JAVA_FLOAT, 0, arr, 0, n);
+            return arr;
+        }
+
+        public double[] toDoubleArray() {
+            int n = (int) (segment.byteSize() / java.lang.foreign.ValueLayout.JAVA_DOUBLE.byteSize());
+            double[] arr = new double[n];
+            java.lang.foreign.MemorySegment.copy(segment, java.lang.foreign.ValueLayout.JAVA_DOUBLE, 0, arr, 0, n);
+            return arr;
+        }
+
+        public int[] toIntArray() {
+            int n = (int) (segment.byteSize() / java.lang.foreign.ValueLayout.JAVA_INT.byteSize());
+            int[] arr = new int[n];
+            java.lang.foreign.MemorySegment.copy(segment, java.lang.foreign.ValueLayout.JAVA_INT, 0, arr, 0, n);
+            return arr;
+        }
+
+        public long[] toLongArray() {
+            int n = (int) (segment.byteSize() / java.lang.foreign.ValueLayout.JAVA_LONG.byteSize());
+            long[] arr = new long[n];
+            java.lang.foreign.MemorySegment.copy(segment, java.lang.foreign.ValueLayout.JAVA_LONG, 0, arr, 0, n);
+            return arr;
+        }
+
+        public boolean[] toBoolArray() {
+            int n = (int) (segment.byteSize() / java.lang.foreign.ValueLayout.JAVA_BOOLEAN.byteSize());
+            boolean[] arr = new boolean[n];
+            java.lang.foreign.MemorySegment.copy(segment, java.lang.foreign.ValueLayout.JAVA_BOOLEAN, 0, arr, 0, n);
+            return arr;
+        }
+    }
+
     /** Canonical constructor. Every public constructor funnels through here. */
     private ConcreteNDArray(Storage storage, Shape shape, Device device) {
         this.storage = storage;
@@ -155,11 +214,26 @@ public class ConcreteNDArray implements NDArray {
     // that has already established the matching dtype (via the requireFloating
     // guards, an explicit dtype check, or a storage switch), so the cast is
     // always safe.
-    private float[]   f32() { return ((F32Storage) storage).data(); }
-    private double[]  f64() { return ((F64Storage) storage).data(); }
-    private int[]     i32() { return ((I32Storage) storage).data(); }
-    private long[]    i64() { return ((I64Storage) storage).data(); }
-    private boolean[] bl()  { return ((BoolStorage) storage).data(); }
+    private float[] f32() {
+        if (storage instanceof NativeStorage ns) return ns.toFloatArray();
+        return ((F32Storage) storage).data();
+    }
+    private double[] f64() {
+        if (storage instanceof NativeStorage ns) return ns.toDoubleArray();
+        return ((F64Storage) storage).data();
+    }
+    private int[] i32() {
+        if (storage instanceof NativeStorage ns) return ns.toIntArray();
+        return ((I32Storage) storage).data();
+    }
+    private long[] i64() {
+        if (storage instanceof NativeStorage ns) return ns.toLongArray();
+        return ((I64Storage) storage).data();
+    }
+    private boolean[] bl() {
+        if (storage instanceof NativeStorage ns) return ns.toBoolArray();
+        return ((BoolStorage) storage).data();
+    }
 
     private void requireDtype(DType expected, String accessor) {
         if (dtype != expected) {
@@ -393,6 +467,15 @@ public class ConcreteNDArray implements NDArray {
             }
             case BoolStorage s -> throw new IllegalArgumentException(
                 primitive + " requires FLOAT32, INT32, FLOAT64, or INT64 operands, got " + dtype);
+            case NativeStorage s -> {
+                double[] thisData = f64();
+                double[] otherData = other.toDoubleArray();
+                for (int i = 0; i < result.length; i++) {
+                    double v1 = thisData[shape.broadcastIndex(outShape, i)];
+                    double v2 = otherData[other.shape().broadcastIndex(outShape, i)];
+                    result[i] = test.test(v1, v2);
+                }
+            }
         }
         return new ConcreteNDArray(result, outShape, device);
     }
@@ -655,6 +738,12 @@ public class ConcreteNDArray implements NDArray {
                 }
                 return new ConcreteNDArray(out, outShape, device);
             }
+            case NativeStorage s -> {
+                double[] in = f64();
+                double[] out = new double[size];
+                sliceCopyF64(in, out, outDims, starts, steps, inStrides, rank);
+                return new ConcreteNDArray(out, outShape, device);
+            }
         }
     }
 
@@ -812,6 +901,7 @@ public class ConcreteNDArray implements NDArray {
             case I32Storage s -> new ConcreteNDArray(s.data(), newShape, device);
             case I64Storage s -> new ConcreteNDArray(s.data(), newShape, device);
             case BoolStorage s -> new ConcreteNDArray(s.data(), newShape, device);
+            case NativeStorage s -> new ConcreteNDArray(s, newShape, device);
         };
     }
 
@@ -1091,6 +1181,61 @@ public class ConcreteNDArray implements NDArray {
     public long[] toLongArray() {
         requireDtype(DType.INT64, "toLongArray");
         return i64();
+    }
+
+    @Override
+    public boolean isNative() {
+        return storage instanceof NativeStorage;
+    }
+
+    @Override
+    public java.lang.foreign.MemorySegment asMemorySegment() {
+        if (storage instanceof NativeStorage ns) {
+            return ns.segment();
+        }
+        return switch (storage) {
+            case F32Storage s -> java.lang.foreign.MemorySegment.ofArray(s.data());
+            case F64Storage s -> java.lang.foreign.MemorySegment.ofArray(s.data());
+            case I32Storage s -> java.lang.foreign.MemorySegment.ofArray(s.data());
+            case I64Storage s -> java.lang.foreign.MemorySegment.ofArray(s.data());
+            case BoolStorage s -> {
+                byte[] bytes = new byte[s.data().length];
+                for (int i = 0; i < bytes.length; i++) bytes[i] = (byte) (s.data()[i] ? 1 : 0);
+                yield java.lang.foreign.MemorySegment.ofArray(bytes);
+            }
+            default -> throw new IllegalStateException("Unknown storage: " + storage);
+        };
+    }
+
+    /**
+     * Creates a {@link ConcreteNDArray} wrapping an existing native {@link java.lang.foreign.MemorySegment}.
+     */
+    public static ConcreteNDArray fromSegment(java.lang.foreign.MemorySegment segment, Shape shape, DType dtype, Device device) {
+        return new ConcreteNDArray(new NativeStorage(segment, dtype), shape, device);
+    }
+
+    public static ConcreteNDArray fromSegment(java.lang.foreign.MemorySegment segment, Shape shape, DType dtype) {
+        return fromSegment(segment, shape, dtype, Device.defaultDevice());
+    }
+
+    /**
+     * Allocates an off-heap native {@link ConcreteNDArray} in the provided {@link java.lang.foreign.Arena}.
+     */
+    public static ConcreteNDArray allocateNative(Shape shape, DType dtype, java.lang.foreign.Arena arena, Device device) {
+        long elementCount = shape.size();
+        java.lang.foreign.ValueLayout layout = switch (dtype) {
+            case FLOAT32 -> java.lang.foreign.ValueLayout.JAVA_FLOAT;
+            case FLOAT64 -> java.lang.foreign.ValueLayout.JAVA_DOUBLE;
+            case INT32 -> java.lang.foreign.ValueLayout.JAVA_INT;
+            case INT64 -> java.lang.foreign.ValueLayout.JAVA_LONG;
+            case BOOL -> java.lang.foreign.ValueLayout.JAVA_BOOLEAN;
+        };
+        java.lang.foreign.MemorySegment segment = arena.allocate(layout, elementCount);
+        return fromSegment(segment, shape, dtype, device);
+    }
+
+    public static ConcreteNDArray allocateNative(Shape shape, DType dtype, java.lang.foreign.Arena arena) {
+        return allocateNative(shape, dtype, arena, Device.defaultDevice());
     }
 
     @Override

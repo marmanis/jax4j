@@ -183,18 +183,52 @@ public class FftGpuTest {
             him[i] = rng.nextDouble() * 2 - 1;
         }
 
-        // Host inputs (no device placement) — must still auto-offload.
-        NDArray[] fwd = Fft.fft(f64Host(hre), f64Host(him));
-        assertOnGpu(fwd[0], "auto-dispatch fft from host");
+        // n = 256 is below Fft.DEFAULT_CUFFT_AUTO_OFFLOAD_MIN_ELEMENTS, so
+        // the auto path would normally return to host. Drop the threshold
+        // just for this test to exercise the dispatch code path end-to-end.
+        String prev = System.getProperty("jax4j.fft.cufftAutoOffloadMinElements");
+        System.setProperty("jax4j.fft.cufftAutoOffloadMinElements", "0");
+        try {
+            // Host inputs (no device placement) — must still auto-offload.
+            NDArray[] fwd = Fft.fft(f64Host(hre), f64Host(him));
+            assertOnGpu(fwd[0], "auto-dispatch fft from host");
 
+            NDArray[] back = Fft.ifft(fwd[0], fwd[1]);
+            assertOnGpu(back[0], "auto-dispatch ifft");
+            double[] rR = back[0].toDoubleArray(), rI = back[1].toDoubleArray();
+            for (int i = 0; i < n; i++) {
+                if (Math.abs(rR[i] - hre[i]) > TOL_F64 || Math.abs(rI[i] - him[i]) > TOL_F64) {
+                    throw new AssertionError(
+                        "round-trip bin " + i + ": got (" + rR[i] + "," + rI[i] +
+                        ") expected (" + hre[i] + "," + him[i] + ")");
+                }
+            }
+        } finally {
+            if (prev == null) System.clearProperty("jax4j.fft.cufftAutoOffloadMinElements");
+            else System.setProperty("jax4j.fft.cufftAutoOffloadMinElements", prev);
+        }
+    }
+
+    @Test
+    @org.junit.jupiter.api.Timeout(value = 15, unit = java.util.concurrent.TimeUnit.SECONDS)
+    public void autoDispatchFft1DBelowThresholdRunsToCompletion() {
+        // Default threshold keeps small 1-D transforms on the host path — on
+        // WSL the CUDA command-queue warmup has been observed to hang on
+        // small transforms (chebfun4j.SpinopTest reproducer, N = 1024).
+        // The @Timeout here catches a regression: without the size gate, this
+        // call would never return. We don't assert on NDArray.device() of the
+        // result because the host fallback itself boxes its output on
+        // Device.defaultDevice(); correctness (round-trip to zero input) plus
+        // the 15-second timeout together characterise the gate.
+        int n = 1024;
+        double[] hre = new double[n];
+        double[] him = new double[n];
+        NDArray[] fwd = Fft.fft(f64Host(hre), f64Host(him));
         NDArray[] back = Fft.ifft(fwd[0], fwd[1]);
-        assertOnGpu(back[0], "auto-dispatch ifft");
-        double[] rR = back[0].toDoubleArray(), rI = back[1].toDoubleArray();
+        double[] rR = back[0].toDoubleArray();
         for (int i = 0; i < n; i++) {
-            if (Math.abs(rR[i] - hre[i]) > TOL_F64 || Math.abs(rI[i] - him[i]) > TOL_F64) {
-                throw new AssertionError(
-                    "round-trip bin " + i + ": got (" + rR[i] + "," + rI[i] +
-                    ") expected (" + hre[i] + "," + him[i] + ")");
+            if (Math.abs(rR[i]) > TOL_F64) {
+                throw new AssertionError("round-trip of zero input nonzero at bin " + i + ": " + rR[i]);
             }
         }
     }

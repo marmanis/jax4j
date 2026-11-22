@@ -729,6 +729,9 @@ public final class Fft {
         int n0 = d[0], n1 = d[1];
         if (n0 < 2 || n1 < 2 || (n0 & (n0 - 1)) != 0 || (n1 & (n1 - 1)) != 0) return null;
 
+        // Size gate for the auto-dispatch path (see tryCuFft for rationale).
+        if (!shouldAutoOffloadToGpu((long) n0 * n1)) return null;
+
         Device dev = re.device();
         if (dev == null || dev == Device.host()) {
             dev = Device.defaultDevice();
@@ -1285,6 +1288,33 @@ public final class Fft {
     }
 
     /**
+     * Default minimum element count for auto-offload of host-resident 1-D /
+     * 2-D inputs to cuFFT. Overridable at any time via the system property
+     * {@code jax4j.fft.cufftAutoOffloadMinElements} (re-read on every call).
+     * Default: {@code 65536} (= 2<sup>16</sup>). Below the threshold, the
+     * host-to-device transfer plus the per-thread CUDA command-queue warmup
+     * dominate the transform itself, and the host radix-2 loop is faster
+     * (and more importantly, actually returns — on WSL the CUDA warmup
+     * has been observed to hang indefinitely on small 1-D transforms). Set
+     * the property to {@code 0} to force every eligible call to GPU (matches
+     * pre-threshold behaviour), or to {@link Long#MAX_VALUE} to disable
+     * auto-offload entirely. Device-resident inputs and the explicit
+     * {@code *OnDevice} entry points bypass this threshold — the caller has
+     * already opted in.
+     */
+    public static final long DEFAULT_CUFFT_AUTO_OFFLOAD_MIN_ELEMENTS = 65536L;
+
+    private static boolean shouldAutoOffloadToGpu(long elements) {
+        String s = System.getProperty("jax4j.fft.cufftAutoOffloadMinElements");
+        long threshold = DEFAULT_CUFFT_AUTO_OFFLOAD_MIN_ELEMENTS;
+        if (s != null && !s.isBlank()) {
+            try { threshold = Math.max(0L, Long.parseLong(s.trim())); }
+            catch (NumberFormatException ignored) { /* keep default */ }
+        }
+        return elements >= threshold;
+    }
+
+    /**
      * Attempt cuFFT dispatch. Returns {@code null} when the path is
      * unavailable — inputs on the host, non-power-of-two length, cuFFT
      * classes missing at runtime, or the dispatch itself throws. The
@@ -1298,10 +1328,16 @@ public final class Fft {
         int n = re.shape().dimensions()[0];
         if (n < 2 || (n & (n - 1)) != 0) return null;
 
-        // Auto-offload host arrays (e.g. the Kuramoto-Sivashinsky example) by
-        // falling back to the default GPU device, mirroring tryCuFft2. The
-        // dispatch reads host data via toFloatArray/toDoubleArray, so the
-        // inputs need not already be device-resident.
+        // Size gate for the auto-dispatch path. Below the threshold, the
+        // host-to-device transfer plus the per-thread CUDA command-queue
+        // warmup dominate the transform itself; the host radix-2 loop is
+        // faster and, more importantly, cannot hang (observed on WSL). The
+        // gate is unconditional because ConcreteNDArray's 2-arg constructor
+        // places data on Device.defaultDevice() by default, so host-intent
+        // inputs look device-resident. Users who want unconditional GPU
+        // dispatch call fftOnDevice explicitly.
+        if (!shouldAutoOffloadToGpu(n)) return null;
+
         Device dev = re.device();
         if (dev == null || dev == Device.host()) {
             dev = Device.defaultDevice();

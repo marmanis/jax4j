@@ -1,6 +1,8 @@
-# TornadoVM on JDK 25 — setup and benchmarking
+# TornadoVM on JDK 25/27 — setup and benchmarking
 
-This is a run-through for wiring up TornadoVM GPU acceleration on JDK 25 and
+> **Note on JDK 27**: `jax4j` targets **JDK 27** (`<maven.compiler.release>27</maven.compiler.release>`) and utilizes Project Panama Foreign Function & Memory (FFM) APIs with `--enable-native-access=ALL-UNNAMED`. For running TornadoVM GPU acceleration, ensure your TornadoVM SDK matches your installed runtime, or run tests with `mvn test -P-tornado` to execute the full CPU/Host and Panama FFM test suite.
+
+This is a run-through for wiring up TornadoVM GPU acceleration on JDK 25/27 and
 running [`BackendBenchmark`](../src/main/java/com/marmanis/jax4j/examples/BackendBenchmark.java)
 to compare single-core CPU, multi-core CPU, CPU-via-OpenCL, and NVIDIA GPU.
 
